@@ -1,18 +1,34 @@
-DIU EVENT-X — Supabase integration status
+DIU EVENT-X — SUPABASE AUTH PHASE 2
 
-এই ZIP-এ যা করা হয়েছে:
-1. Supabase JS v2 CDN যুক্ত করা হয়েছে।
-2. Supabase project URL ও publishable key দিয়ে client initialize করার config যুক্ত করা হয়েছে।
-3. মূল style.css, logo, images এবং layout অপরিবর্তিত রাখা হয়েছে।
+এই build-এ Supabase Auth integration যোগ করা হয়েছে:
+- Student signup uses Supabase Auth.
+- Signup trigger creates public.profiles (requires supplied SQL schema).
+- Student ID and department are saved to student_profiles after authenticated login/signup.
+- Student preferences are initialized in student_preferences.
+- Login and logout use Supabase Auth.
+- Existing authenticated session is restored on page load.
+- Forgot password sends Supabase password-reset email; reset form uses Supabase updateUser.
+- Profile name, department and preferences are synced to Supabase.
+- Existing style.css and visual assets are unchanged.
 
-গুরুত্বপূর্ণ: এটি এখনো পূর্ণ Supabase integration নয়। মূল app.js এখনো browser LocalStorage demo database ব্যবহার করে। তাই login/registration/event CRUD/approval/notifications এখনো Supabase-এ persist করে না। এই ZIP-কে production-ready বা complete বলা যাবে না।
+IMPORTANT LIMITATION — NOT A COMPLETE MULTI-USER DATABASE BUILD YET
+The existing event, registration, volunteer, saved-event, post-review, news,
+notification, admin-management and reporting workflows still use the original
+browser-side demo data model in app.js. They are NOT yet fully synchronized
+with Supabase tables. Public event listings also still come from the local demo
+seed. Do not describe this build as full backend integration.
 
-পরবর্তী integration কাজ:
-- Supabase Auth login/signup/password reset
-- profiles + student_profiles + preferences mapping
-- events, registrations, volunteer applications, saved events, submissions, news ও notifications-এর read/write mapping
-- existing numeric UI IDs থেকে Supabase UUID mapping
-- RLS অনুযায়ী staff/admin/manager operations এবং error handling
-- demo seed/localStorage removal এবং end-to-end test
+SETUP
+1. In Supabase SQL Editor, run DIU_EVENT_X_Supabase_Setup.sql (the revised file
+   includes the profile self-update RLS policy).
+2. In Supabase Authentication > URL Configuration, add your GitHub Pages URL
+   to Site URL and Redirect URLs. Example:
+   https://YOUR-USERNAME.github.io/DIU-EVENT-X/
+3. If email confirmation is enabled, confirm the signup email before login.
+4. Upload all files in this folder to the repository root, preserving filenames.
+5. Test signup with a new email. After login, check profiles,
+   student_profiles and student_preferences in Table Editor.
 
-Security: frontend-এ publishable key রাখা স্বাভাবিক; service_role key কখনো frontend-এ দেবেন না। RLS অবশ্যই enabled রাখতে হবে।
+SECURITY
+Only the Supabase publishable key is used in the browser. Never put a
+service_role/secret key in this project.

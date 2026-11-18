@@ -1,54 +1,31 @@
-# DIU EVENT-X
+# DIU EVENT-X — Supabase Auth build
 
-A student portal for finding and managing events, seminars, workshops, competitions, volunteer roles and external opportunities at Daffodil International University (DIU).
+This package is based on the uploaded Phase 2 project. The original visual
+assets and `style.css` are retained unchanged.
 
-This version is a **static website** (plain HTML, CSS and JavaScript). It needs no server or database, so it can be hosted for free on GitHub Pages.
+## Connected
+- Supabase Auth student signup, login and logout
+- Auth session restoration
+- `profiles` row creation through the supplied database trigger
+- Student ID and department in `student_profiles`
+- Student preferences in `student_preferences`
+- Profile updates
+- Supabase password-reset email and password update
 
-## Features
+## Not fully connected yet
+Events, event registrations/approvals, volunteer applications, saved events,
+event submissions/reviews, news, notifications, admin/manager management,
+and reports still use the original browser-side demo data model. This is not
+a complete multi-user backend or production-ready release. See
+`NEXT_STEPS_BN.txt` and `INTEGRATION_STATUS_BN.txt`.
 
-- **Students:** search and filter events, register, apply as a volunteer, save events, submit posts for approval, get recommendations from their department and interests, view notifications.
-- **Admins:** review posts (approve or reject with a note), approve registrations and volunteer applications, manage events and news.
-- **Manager:** publish approved posts, manage students and admins (maximum 3 active admins), see reports and an overview chart.
-- **Accounts:** register, log in (with Remember me), password reset with a 6-digit code that expires in 10 minutes, and a lock-out prompt after 3 failed logins.
+## Setup
+1. Run `DIU_EVENT_X_Supabase_Setup.sql` once in Supabase SQL Editor.
+2. Configure the GitHub Pages URL in Supabase Authentication > URL Configuration
+   (Site URL and Redirect URLs).
+3. Extract this ZIP and upload/replace the files in your GitHub repository root.
+4. Register with a new email. Confirm it if email confirmation is enabled.
+5. Check `profiles`, `student_profiles`, and `student_preferences` in Supabase.
 
-## Demo accounts
-
-Every demo account uses the password `password`.
-
-| Role    | Email                     |
-|---------|---------------------------|
-| Student | student@diueventx.test    |
-| Admin   | admin@diueventx.test      |
-| Manager | manager@diueventx.test    |
-
-## Important limits of this version
-
-- All data (accounts, posts, registrations) is saved in the **visitor's own browser** (`localStorage`). Two visitors do not see each other's data. Use **Reset demo data** in the footer to restore the sample data.
-- The password reset code is shown on screen, because a static site cannot send email.
-- "Continue with Google / Microsoft" only shows a notice. Real sign-in needs a server.
-- For a real multi-user system, use the PHP + MySQL version of the project.
-
-## Publish on GitHub Pages
-
-1. Create a new **public** repository on GitHub, for example `diu-event-x`.
-2. Upload every file and folder from this project (`index.html`, `assets/`, `.nojekyll`, `README.md`) to the repository root.
-3. Open **Settings > Pages**. Under **Build and deployment**, set **Source** to **Deploy from a branch**, choose the `main` branch and the `/ (root)` folder, then **Save**.
-4. After a minute or two the site is live at `https://YOUR-USERNAME.github.io/diu-event-x/`.
-
-### Help people find it on Google
-
-- Give the repository a clear description and topics such as `diu`, `events`, `student-portal`.
-- Open [Google Search Console](https://search.google.com/search-console), add your site URL and use **URL Inspection > Request indexing**.
-- Link to the site from your profile README, project report or university pages. Google can take several days or weeks to list a new site.
-
-## Project structure
-
-```
-index.html
-assets/
-  css/style.css
-  js/app.js
-  favicon.svg
-.nojekyll
-README.md
-```
+Only the Supabase publishable key is included in the browser. Never expose a
+service-role/secret key in frontend code.

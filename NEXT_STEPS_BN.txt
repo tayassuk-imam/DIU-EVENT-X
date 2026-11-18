@@ -1,0 +1,43 @@
+DIU EVENT-X — বর্তমান Build-এর অবস্থা
+====================================
+
+এই ZIP-টি তোমার GitHub-এ দেওয়া Phase 2 project-এর ওপর ভিত্তি করে।
+মূল style.css, HTML layout, logo এবং visual assets পরিবর্তন করা হয়নি।
+
+যা Supabase-এ যুক্ত আছে:
+- Student signup (Supabase Auth)
+- Student login/logout
+- Auth session restore
+- profiles row trigger (SQL setup চালানো থাকতে হবে)
+- student_profiles-এ Student ID ও Department
+- student_preferences initialize/update
+- Forgot password email এবং Supabase password update
+- Profile name/department/preferences update
+
+যা এখনো Supabase-এ সম্পূর্ণ যুক্ত নয়:
+- Events CRUD/listing
+- Event registrations এবং approval
+- Volunteer applications এবং approval
+- Saved events
+- Event submissions এবং admin/manager review
+- News CRUD
+- Notifications
+- Admin/manager user management ও reporting
+
+উপরের অসম্পূর্ণ feature-গুলো এখনও browser-side demo data model-এ চলে।
+তাই এটিকে Full Supabase Integration বা production-ready build বলা যাবে না।
+
+Setup:
+1. Supabase SQL Editor-এ DIU_EVENT_X_Supabase_Setup.sql একবার চালাও।
+2. Authentication > URL Configuration-এ GitHub Pages Site URL এবং Redirect URL যোগ করো।
+3. ZIP extract করে ভেতরের ফাইলগুলো repository root-এ upload/replace করো।
+4. নতুন email দিয়ে registration পরীক্ষা করো। Email confirmation চালু থাকলে আগে email confirm করো।
+5. Supabase Table Editor-এ profiles, student_profiles, student_preferences পরীক্ষা করো।
+
+Security:
+- Browser-এ শুধু publishable key আছে। service_role key কখনো frontend-এ দেবে না।
+- Admin/manager role SQL দিয়ে trusted operator-কে assign করতে হবে; frontend থেকে role assign করবে না।
+
+Validation:
+- app.js Node syntax check পাস করেছে।
+- এই পরিবেশ থেকে তোমার Supabase project-এ live signup বা RLS end-to-end test করা সম্ভব হয়নি।

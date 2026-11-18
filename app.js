@@ -100,6 +100,39 @@ const MARK=LOGO;
 
 /* ================= database (browser only) ================= */
 let db=null;
+const sb=window.diuEventxSupabase||null;
+let authUser=null;
+function localUserForAuth(profile, auth, student, preference){
+  let u=db.users.find(x=>x.auth_id===auth.id);
+  if(!u){u={id:nid('users'),auth_id:auth.id,email:auth.email||'',name:profile.full_name||auth.user_metadata?.full_name||'Student',role:profile.role||'student',status:profile.account_status||'active',created:profile.created_at||new Date().toISOString()};db.users.push(u);}
+  u.auth_id=auth.id;u.email=auth.email||u.email;u.name=profile.full_name||u.name;u.role=profile.role||'student';u.status=profile.account_status||'active';
+  const st=student||{};let row=db.students.find(x=>x.user_id===u.id);
+  if(!row){row={user_id:u.id,student_id:st.student_id||auth.user_metadata?.student_id||''};db.students.push(row);}else if(st.student_id)row.student_id=st.student_id;
+  const pr=preference||{};let pf=db.prefs.find(x=>x.user_id===u.id);
+  if(!pf){pf={user_id:u.id,department_id:st.department_id||null,interests:pr.interests||'',category_id:pr.preferred_category_id||null};db.prefs.push(pf);}else{pf.department_id=st.department_id||pf.department_id;pf.interests=pr.interests??pf.interests;pf.category_id=pr.preferred_category_id||pf.category_id;}
+  save();return u;
+}
+async function hydrateAuthUser(auth){
+  if(!sb||!auth)return null;
+  const {data:pr,error:pe}=await sb.from('profiles').select('*').eq('id',auth.id).maybeSingle();
+  if(pe)throw pe;if(!pr)return null;
+  const [{data:st,error:se},{data:pf,error:pfe}]=await Promise.all([
+    sb.from('student_profiles').select('*').eq('user_id',auth.id).maybeSingle(),
+    sb.from('student_preferences').select('*').eq('user_id',auth.id).maybeSingle()
+  ]);
+  if(se)throw se;if(pfe)throw pfe;
+  // Complete student rows after email confirmation, using signup metadata.
+  if(pr.role==='student'&&!st&&auth.user_metadata?.student_id){
+    const {error}=await sb.from('student_profiles').upsert({user_id:auth.id,student_id:auth.user_metadata.student_id,department_id:auth.user_metadata.department_id||null},{onConflict:'user_id'});
+    if(error)throw error;
+    const {data:st2,error:e2}=await sb.from('student_profiles').select('*').eq('user_id',auth.id).single();if(e2)throw e2;
+    st2 && Object.assign(st||{},st2);
+  }
+  if(pr.role==='student'&&!pf){const {error}=await sb.from('student_preferences').upsert({user_id:auth.id,interests:'',preferred_category_id:null},{onConflict:'user_id'});if(error)throw error;}
+  const {data:stFinal}=await sb.from('student_profiles').select('*').eq('user_id',auth.id).maybeSingle();
+  const {data:pfFinal}=await sb.from('student_preferences').select('*').eq('user_id',auth.id).maybeSingle();
+  return localUserForAuth(pr,auth,stFinal||st,pfFinal||pf);
+}
 const save=()=>ls.set(KEY,JSON.stringify(db));
 const nid=t=>(db.seq[t]=(db.seq[t]||0)+1);
 const cat=id=>db.cats.find(c=>c.id===id);
@@ -773,20 +806,16 @@ F.filters=(f,fd)=>{const p=new URLSearchParams();['q','department','category','t
 F.login=async(f,fd)=>{
   const email=val(fd,'email').toLowerCase(),pw=String(fd.get('password')||'');
   if(!email||!pw)return formError(f,'Enter your email and password.');
-  const u=db.users.find(x=>x.email===email);
-  let ok=false;if(u&&u.status==='active')ok=await checkPw(pw,u.pw);
-  if(ok){
-    ss.set('attempts','0');
-    if(fd.get('remember')){ls.set('uid',String(u.id));ss.del('uid');}else{ss.set('uid',String(u.id));ls.del('uid');}
+  if(!sb)return formError(f,'Supabase connection is unavailable. Check supabase-config.js and internet access.');
+  const {data,error}=await sb.auth.signInWithPassword({email,password:pw});
+  if(error){const n=(+ss.get('attempts')||0)+1;ss.set('attempts',String(n));return formError(f,n>=3?'Login failed. Check your email/password or reset your password.':'Email or password is incorrect. Attempt '+n+' of 3.');}
+  try{
+    const u=await hydrateAuthUser(data.user);if(!u)throw new Error('Your profile was not created. Run the supplied Supabase SQL setup and check the signup trigger.');
+    if(u.status!=='active'){await sb.auth.signOut();return formError(f,'This account is inactive. Ask the DIU EVENT-X manager.');}
+    ss.set('attempts','0');ss.set('uid',String(u.id));ls.del('uid');
     const next=new URLSearchParams((location.hash.split('?')[1])||'').get('next');
-    toast('Welcome back, '+u.name.split(' ')[0]+'.');
-    go(next&&next.charAt(0)==='/'&&next.charAt(1)!=='/'?next:dashPath(u.role));return;
-  }
-  const n=(+ss.get('attempts')||0)+1;ss.set('attempts',String(n));
-  if(u&&u.status!=='active')toast('This account is inactive. Ask the DIU EVENT-X manager to reactivate it.','danger');
-  else toast(n>=3?'3 login attempts failed. Reset your password to continue.':'Email or password is incorrect. Attempt '+n+' of 3.','danger');
-  if(n===3)render(true);
-  else formError(f,n>=3?'Email or password is incorrect.':'Email or password is incorrect. Attempt '+n+' of 3.');
+    toast('Welcome back, '+u.name.split(' ')[0]+'.');go(next&&next.charAt(0)==='/'&&next.charAt(1)!=='/'?next:dashPath(u.role));
+  }catch(err){console.error(err);formError(f,err.message||'Could not load your Supabase profile.');}
 };
 F.register=async(f,fd)=>{
   const name=val(fd,'name'),sid=val(fd,'student_id'),email=val(fd,'email').toLowerCase(),dp=+fd.get('department_id'),pw=String(fd.get('password')||''),c=String(fd.get('confirm_password')||'');
@@ -794,24 +823,23 @@ F.register=async(f,fd)=>{
   if(!emailOk(email))return formError(f,'Enter a valid email address.');
   if(pw.length<8)return formError(f,'Your password needs at least 8 characters.');
   if(pw!==c)return formError(f,'The two passwords do not match.');
-  if(db.users.some(x=>x.email===email))return formError(f,'This email is already registered. Log in or use another email.');
-  if(db.students.some(s=>s.student_id.toLowerCase()===sid.toLowerCase()))return formError(f,'This student ID is already registered.');
-  const uid=nid('users');
-  db.users.push({id:uid,name,email,pw:await hashPw(pw),role:'student',status:'active',created:new Date().toISOString()});
-  db.students.push({user_id:uid,student_id:sid});db.prefs.push({user_id:uid,department_id:dp,interests:'',category_id:null});
-  notify(uid,'Welcome to DIU EVENT-X','Add your interests in your profile to get event recommendations.');save();
-  toast('Account created. Log in to continue.');go('/login');
+  if(!sb)return formError(f,'Supabase connection is unavailable. Check configuration and internet access.');
+  const {data,error}=await sb.auth.signUp({email,password:pw,options:{data:{full_name:name,student_id:sid,department_id:dp},emailRedirectTo:location.origin+location.pathname}});
+  if(error)return formError(f,error.message);
+  if(data.user && data.session){
+    try{await hydrateAuthUser(data.user);const {error:spErr}=await sb.from('student_profiles').upsert({user_id:data.user.id,student_id:sid,department_id:dp},{onConflict:'user_id'});if(spErr)throw spErr;const {error:pfErr}=await sb.from('student_preferences').upsert({user_id:data.user.id,interests:'',preferred_category_id:null},{onConflict:'user_id'});if(pfErr)throw pfErr;}
+    catch(err){console.error(err);return formError(f,'Account created, but student details could not be saved: '+err.message);}
+    toast('Account created successfully. You can now log in.');go('/login');
+  }else{
+    toast('Registration submitted. Check your email to confirm your account, then log in.');go('/login');
+  }
 };
 F.forgot=async(f,fd)=>{
-  const email=val(fd,'email').toLowerCase();
-  const u=db.users.find(x=>x.email===email&&x.status==='active');
-  if(!u)return formError(f,'No active account uses that email.');
-  const a=new Uint32Array(1);try{crypto.getRandomValues(a);}catch(e){a[0]=Math.floor(Math.random()*4e9);}
-  const otp=String(100000+a[0]%900000);
-  db.otps.forEach(o=>{if(o.user_id===u.id)o.used=true;});
-  db.otps.push({id:nid('otps'),user_id:u.id,hash:await hashPw(otp),expires:Date.now()+10*60000,used:false,tries:0});save();
-  ss.set('reset_email',email);ss.set('demo_otp',otp);ss.del('reset_uid');
-  toast('Verification code generated. It expires in 10 minutes.');go('/verify');
+  const email=val(fd,'email').toLowerCase();if(!email)return formError(f,'Enter your email address.');
+  if(!sb)return formError(f,'Supabase connection is unavailable.');
+  const {error}=await sb.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname+'#/' });
+  if(error)return formError(f,error.message);
+  toast('Password reset email sent. Check your inbox and spam folder.');go('/login');
 };
 F.verify=async(f,fd)=>{
   const email=ss.get('reset_email'),code=val(fd,'otp');
@@ -827,17 +855,18 @@ F.reset=async(f,fd)=>{
   const pw=String(fd.get('password')||''),c=String(fd.get('confirm_password')||'');
   if(pw.length<8)return formError(f,'Your password needs at least 8 characters.');
   if(pw!==c)return formError(f,'The two passwords do not match.');
+  if(sb){const {data:{user:au}}=await sb.auth.getUser();if(!au)return formError(f,'Open the password-reset link from your email first.');const {error}=await sb.auth.updateUser({password:pw});if(error)return formError(f,error.message);['reset_uid','reset_email','demo_otp','attempts'].forEach(k=>ss.del(k));toast('Password updated. Log in with your new password.');go('/login');return;}
   const u=user(Number(ss.get('reset_uid')));if(!u)return formError(f,'Start again from Forgot password.');
   u.pw=await hashPw(pw);save();
   ['reset_uid','reset_email','demo_otp','attempts'].forEach(k=>ss.del(k));
   toast('Password updated. Log in with your new password.');go('/login');
 };
-F.profile=(f,fd)=>{
+F.profile=async(f,fd)=>{
   const u=need('student');if(!u)return;
   const name=val(fd,'name');if(!name)return formError(f,'Your name cannot be empty.');
   u.name=name;const pf=pref(u.id);
   pf.department_id=+fd.get('department_id')||null;pf.interests=val(fd,'interests');pf.category_id=+fd.get('category_id')||null;
-  save();toast('Profile saved.');render(true);
+  save();if(sb&&u.auth_id){const [{error:e1},{error:e2}]=await Promise.all([sb.from('profiles').update({full_name:name}).eq('id',u.auth_id),sb.from('student_profiles').upsert({user_id:u.auth_id,department_id:pf.department_id},{onConflict:'user_id'})]);if(e1||e2)return formError(f,(e1||e2).message);const {error:e3}=await sb.from('student_preferences').upsert({user_id:u.auth_id,interests:pf.interests,preferred_category_id:pf.category_id},{onConflict:'user_id'});if(e3)return formError(f,e3.message);}toast('Profile saved.');render(true);
 };
 F.submit=(f,fd)=>{
   const u=need('student');if(!u)return;
@@ -906,7 +935,7 @@ F.password=async(f,fd)=>{
 /* ================= click actions ================= */
 const A={};
 A.menu=el=>{const n=$('#nav');const o=n.classList.toggle('open');el.setAttribute('aria-expanded',o?'true':'false');};
-A.logout=()=>{ss.del('uid');ls.del('uid');toast('You are logged out.');go('/');};
+A.logout=async()=>{if(sb)await sb.auth.signOut();authUser=null;ss.del('uid');ls.del('uid');toast('You are logged out.');go('/');};
 A['dlg-close']=()=>closeDlg();
 A.demo=el=>{
   const em={student:'student@diueventx.test',admin:'admin@diueventx.test',manager:'manager@diueventx.test'}[el.dataset.role];
@@ -1046,6 +1075,7 @@ document.addEventListener('input',e=>{
 async function main(){
   applyTheme();
   db=await loadDb();
+  if(sb){try{const {data:{session}}=await sb.auth.getSession();if(session?.user){const u=await hydrateAuthUser(session.user);if(u&&u.status==='active')ss.set('uid',String(u.id));}sb.auth.onAuthStateChange((event,session)=>{if(event==='SIGNED_OUT'){authUser=null;ss.del('uid');}else if(session?.user){authUser=session.user;}});}catch(err){console.error('Supabase session restore failed:',err);}}
   window.addEventListener('hashchange',()=>render());
   render();
 }

@@ -239,6 +239,12 @@ create policy "profiles read own or staff" on public.profiles
 for select to authenticated
 using (id = (select auth.uid()) or public.is_staff());
 
+drop policy if exists "profiles update own" on public.profiles;
+create policy "profiles update own" on public.profiles
+for update to authenticated
+using (id = (select auth.uid()))
+with check (id = (select auth.uid()) and role = 'student');
+
 -- Student profile and preferences: each student controls only their own record.
 drop policy if exists "student profile read own or staff" on public.student_profiles;
 create policy "student profile read own or staff" on public.student_profiles
