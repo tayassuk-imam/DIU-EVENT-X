@@ -97,7 +97,7 @@ async function changed(q){const rows=await must(q.select('id'));if(!rows||!rows.
 function niceErr(e){
   const m=String((e&&e.message)||e||'');
   if(/student_profiles_student_id|student_id/i.test(m)&&e&&e.code==='23505')return 'That Student ID is already registered.';
-  if(e&&(e.code==='42501'||/row-level security|permission denied/i.test(m)))return 'You do not have permission to do that.';
+  if(e&&(e.code==='42501'||/row-level security|permission denied/i.test(m)))return 'You do not have permission to do that.'+(m?' ('+m.slice(0,140)+')':'');
   if(e&&e.code==='23505')return 'That record already exists.';
   if(/over_email_send_rate_limit|rate limit/i.test(m))return 'Too many emails were requested. Please wait a few minutes and try again.';
   if(/Failed to fetch|NetworkError|Load failed/i.test(m))return 'Network problem. Check your internet connection and try again.';
