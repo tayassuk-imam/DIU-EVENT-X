@@ -369,13 +369,399 @@ drop policy if exists "staff create notifications" on public.notifications;
 create policy "staff create notifications" on public.notifications
 for insert to authenticated with check (public.is_staff());
 
--- IMPORTANT:
--- 1) New signups are students by default. Promote the first manager manually in SQL Editor:
---    update public.profiles set role = 'manager' where id = (
---      select id from auth.users where email = 'YOUR_MANAGER_EMAIL'
---    );
--- 2) Add admin accounts by changing role to 'admin' in the same way.
--- 3) Do not put the service_role/secret key in app.js or any browser code.
--- 4) This creates the database structure and security policies only. The current
---    uploaded app.js still uses browser localStorage; it must be integrated with
---    Supabase Auth and database queries before website data is saved online.
+-- =====================================================================
+-- PHASE 2: full backend integration (safe to re-run)
+-- Adds: email column, event status sync, role security, server-side
+-- registration/review functions, notification triggers, realtime.
+-- =====================================================================
+
+-- ---------- profiles.email (needed by manager screens) ----------
+alter table public.profiles add column if not exists email text not null default '';
+update public.profiles p set email = u.email from auth.users u where u.id = p.id and p.email = '';
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.profiles(id, full_name, email, role)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data ->> 'full_name', ''),
+    coalesce(new.email, ''),
+    'student'
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+-- ---------- event status: UI uses published/pending/approved/rejected ----------
+alter table public.events drop constraint if exists events_status_check;
+alter table public.events add constraint events_status_check
+  check (status in ('pending','approved','rejected','published','cancelled','archived'));
+alter table public.events alter column created_by set default auth.uid();
+
+-- ---------- updated_at ----------
+create or replace function public.touch_updated_at()
+returns trigger language plpgsql as $$
+begin new.updated_at := now(); return new; end;
+$$;
+drop trigger if exists events_touch on public.events;
+create trigger events_touch before update on public.events for each row execute function public.touch_updated_at();
+drop trigger if exists news_touch on public.news_posts;
+create trigger news_touch before update on public.news_posts for each row execute function public.touch_updated_at();
+
+-- ---------- role / status protection ----------
+-- Only the manager can change a role or account status (never their own,
+-- never another manager). Max 3 active admins. SQL Editor (no JWT) is allowed.
+create or replace function public.protect_profile_columns()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare n int;
+begin
+  if (select auth.uid()) is not null then
+    if new.id <> old.id then raise exception 'Profile id cannot change.'; end if;
+    if new.email is distinct from old.email then new.email := old.email; end if;
+    if new.role is distinct from old.role or new.account_status is distinct from old.account_status then
+      if not public.is_manager() then
+        raise exception 'Only the manager can change roles or account status.';
+      end if;
+      if old.id = (select auth.uid()) then
+        raise exception 'You cannot change your own role or status.';
+      end if;
+      if old.role = 'manager' or new.role = 'manager' then
+        raise exception 'Manager accounts can only be changed in the database.';
+      end if;
+    end if;
+  end if;
+  if new.role = 'admin' and new.account_status = 'active'
+     and (old.role is distinct from 'admin' or old.account_status is distinct from 'active') then
+    select count(*) into n from public.profiles
+      where role = 'admin' and account_status = 'active' and id <> new.id;
+    if n >= 3 then raise exception 'Maximum of 3 active admins. Deactivate an admin first.'; end if;
+  end if;
+  new.updated_at := now();
+  return new;
+end;
+$$;
+drop trigger if exists profiles_protect on public.profiles;
+create trigger profiles_protect before update on public.profiles
+for each row execute function public.protect_profile_columns();
+
+drop policy if exists "profiles update own" on public.profiles;
+create policy "profiles update own" on public.profiles
+for update to authenticated using (id = (select auth.uid())) with check (id = (select auth.uid()));
+drop policy if exists "manager update accounts" on public.profiles;
+create policy "manager update accounts" on public.profiles
+for update to authenticated
+using (public.is_manager() and role in ('student','admin'))
+with check (public.is_manager() and role in ('student','admin'));
+
+-- ---------- events: staff write, manager-only delete ----------
+drop policy if exists "published events read" on public.events;
+create policy "published events read" on public.events
+for select to anon, authenticated using (
+  status = 'published'
+  or public.is_staff()
+  or exists (select 1 from public.event_registrations r where r.event_id = events.id and r.user_id = (select auth.uid()))
+  or exists (select 1 from public.volunteer_applications v where v.event_id = events.id and v.user_id = (select auth.uid()))
+  or exists (select 1 from public.saved_events s where s.event_id = events.id and s.user_id = (select auth.uid()))
+);
+drop policy if exists "staff delete events" on public.events;
+drop policy if exists "manager delete events" on public.events;
+create policy "manager delete events" on public.events
+for delete to authenticated using (public.is_manager());
+
+-- ---------- registrations / volunteers: students use functions only ----------
+drop policy if exists "students register themselves" on public.event_registrations;
+drop policy if exists "students apply to volunteer" on public.volunteer_applications;
+
+create or replace function public.applications_before_update()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  new.user_id := old.user_id;
+  new.event_id := old.event_id;
+  if new.status is distinct from old.status
+     and (select auth.uid()) is not null and public.is_staff() then
+    new.reviewed_by := (select auth.uid());
+    new.reviewed_at := now();
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists regs_before_update on public.event_registrations;
+create trigger regs_before_update before update on public.event_registrations
+for each row execute function public.applications_before_update();
+drop trigger if exists vols_before_update on public.volunteer_applications;
+create trigger vols_before_update before update on public.volunteer_applications
+for each row execute function public.applications_before_update();
+
+create or replace function public.notify_application_status()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare t text; lbl text;
+begin
+  if new.status is distinct from old.status and new.status in ('approved','rejected') then
+    select title into t from public.events where id = new.event_id;
+    lbl := case when tg_table_name = 'volunteer_applications' then 'Volunteer application' else 'Registration' end;
+    insert into public.notifications(user_id, title, message)
+    values (new.user_id, lbl || ' ' || new.status,
+            'Your ' || lower(lbl) || ' for "' || coalesce(t,'an event') || '" was ' || new.status || '.');
+  end if;
+  return null;
+end;
+$$;
+drop trigger if exists regs_notify on public.event_registrations;
+create trigger regs_notify after update on public.event_registrations
+for each row execute function public.notify_application_status();
+drop trigger if exists vols_notify on public.volunteer_applications;
+create trigger vols_notify after update on public.volunteer_applications
+for each row execute function public.notify_application_status();
+
+-- Register / volunteer: validates event, deadline, duplicates; re-opens a cancelled row.
+create or replace function public.apply_to_event(p_event_id bigint, p_kind text)
+returns bigint
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := (select auth.uid());
+  ev record;
+  cur record;
+  rid bigint;
+  today date := (now() at time zone 'Asia/Dhaka')::date;
+  lbl text;
+begin
+  if uid is null then raise exception 'Please log in first.'; end if;
+  if public.current_user_role() is distinct from 'student' then
+    raise exception 'Only active student accounts can do this.';
+  end if;
+  if p_kind not in ('registration','volunteer') then raise exception 'Invalid request.'; end if;
+  select e.id, e.title, e.status, e.event_date, e.registration_deadline, c.name as cat_name
+    into ev
+    from public.events e join public.event_categories c on c.id = e.category_id
+    where e.id = p_event_id;
+  if not found or ev.status <> 'published' then raise exception 'This event is not open for applications.'; end if;
+  if ev.event_date < today or (ev.registration_deadline is not null and ev.registration_deadline < today) then
+    raise exception 'Registration for this event is closed.';
+  end if;
+  if p_kind = 'volunteer' and ev.cat_name <> 'Volunteer' then
+    raise exception 'This event does not take volunteer applications.';
+  end if;
+  lbl := case when p_kind = 'volunteer' then 'Volunteer application' else 'Registration' end;
+
+  if p_kind = 'registration' then
+    select id, status into cur from public.event_registrations where user_id = uid and event_id = p_event_id;
+    if found then
+      if cur.status <> 'cancelled' then raise exception 'You have already registered for this event.'; end if;
+      update public.event_registrations
+        set status = 'pending', created_at = now(), reviewed_by = null, reviewed_at = null
+        where id = cur.id;
+      rid := cur.id;
+    else
+      insert into public.event_registrations(user_id, event_id) values (uid, p_event_id) returning id into rid;
+    end if;
+  else
+    select id, status into cur from public.volunteer_applications where user_id = uid and event_id = p_event_id;
+    if found then
+      if cur.status <> 'cancelled' then raise exception 'You have already applied for this role.'; end if;
+      update public.volunteer_applications
+        set status = 'pending', created_at = now(), reviewed_by = null, reviewed_at = null
+        where id = cur.id;
+      rid := cur.id;
+    else
+      insert into public.volunteer_applications(user_id, event_id) values (uid, p_event_id) returning id into rid;
+    end if;
+  end if;
+
+  insert into public.notifications(user_id, title, message)
+  values (uid, lbl || ' submitted',
+          'Your ' || lower(lbl) || ' for "' || ev.title || '" is pending approval.');
+  return rid;
+end;
+$$;
+
+create or replace function public.cancel_application(p_event_id bigint, p_kind text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare uid uuid := (select auth.uid()); n int;
+begin
+  if uid is null then raise exception 'Please log in first.'; end if;
+  if p_kind = 'volunteer' then
+    update public.volunteer_applications set status = 'cancelled'
+      where user_id = uid and event_id = p_event_id and status in ('pending','approved');
+  else
+    update public.event_registrations set status = 'cancelled'
+      where user_id = uid and event_id = p_event_id and status in ('pending','approved');
+  end if;
+  get diagnostics n = row_count;
+  if n = 0 then raise exception 'Nothing to cancel.'; end if;
+end;
+$$;
+
+-- ---------- submissions: review only through the function ----------
+drop policy if exists "staff review submissions" on public.event_submissions;
+drop policy if exists "staff delete submissions" on public.event_submissions;
+
+create or replace function public.notify_new_submission()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare nm text;
+begin
+  select full_name into nm from public.profiles where id = new.submitter_id;
+  insert into public.notifications(user_id, title, message)
+    select id, 'New post to review', coalesce(nm,'A student') || ' submitted "' || new.title || '".'
+    from public.profiles where role = 'admin' and account_status = 'active';
+  insert into public.notifications(user_id, title, message)
+    values (new.submitter_id, 'Post submitted', '"' || new.title || '" is waiting for admin review.');
+  return null;
+end;
+$$;
+drop trigger if exists submissions_notify on public.event_submissions;
+create trigger submissions_notify after insert on public.event_submissions
+for each row execute function public.notify_new_submission();
+
+create or replace function public.review_submission(p_id bigint, p_action text, p_note text default '')
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := (select auth.uid());
+  rl text := public.current_user_role();
+  s record;
+  eid bigint;
+  cname text;
+begin
+  if rl not in ('admin','manager') then raise exception 'You do not have access to that action.'; end if;
+  select * into s from public.event_submissions where id = p_id for update;
+  if not found then raise exception 'This post no longer exists.'; end if;
+
+  if p_action = 'approve' then
+    if rl <> 'admin' then raise exception 'Only an admin can approve a post for publishing.'; end if;
+    if s.status <> 'pending' then raise exception 'This post has already been reviewed.'; end if;
+    update public.event_submissions set status = 'approved', reviewed_by = uid, reviewed_at = now() where id = p_id;
+    insert into public.notifications(user_id, title, message)
+      values (s.submitter_id, 'Post approved by admin',
+              '"' || s.title || '" passed admin review and is waiting for the manager to publish it.');
+    insert into public.notifications(user_id, title, message)
+      select id, 'Post ready to publish', '"' || s.title || '" was approved by an admin.'
+      from public.profiles where role = 'manager' and account_status = 'active';
+
+  elsif p_action = 'reject' then
+    if s.event_id is not null or s.status = 'rejected' then raise exception 'This post can no longer be rejected.'; end if;
+    if length(trim(coalesce(p_note,''))) < 3 then raise exception 'Add a short note so the student knows what to fix.'; end if;
+    update public.event_submissions
+      set status = 'rejected', review_note = trim(p_note), reviewed_by = uid, reviewed_at = now() where id = p_id;
+    insert into public.notifications(user_id, title, message)
+      values (s.submitter_id, 'Post rejected', '"' || s.title || '" was rejected. Note: ' || trim(p_note));
+
+  elsif p_action = 'publish' then
+    if rl <> 'manager' then raise exception 'Only the manager can publish a post.'; end if;
+    if s.event_id is not null or s.status = 'rejected' then raise exception 'This post can no longer be published.'; end if;
+    select name into cname from public.event_categories where id = s.category_id;
+    insert into public.events(title, category_id, department_id, organizer, description, event_date, event_time,
+                              location, registration_deadline, registration_link, event_type, status, created_by)
+    values (s.title, s.category_id, s.department_id, s.organizer, s.description, s.event_date, s.event_time,
+            s.location, s.registration_deadline, s.registration_link,
+            case when cname = 'External Opportunity' then 'external' else 'diu' end, 'published', uid)
+    returning id into eid;
+    update public.event_submissions
+      set status = 'approved', event_id = eid, reviewed_by = uid, reviewed_at = now() where id = p_id;
+    insert into public.notifications(user_id, title, message)
+      values (s.submitter_id, 'Post published', '"' || s.title || '" is now live on DIU EVENT-X.');
+  else
+    raise exception 'Invalid action.';
+  end if;
+end;
+$$;
+
+-- ---------- manager: promote a registered account to admin ----------
+create or replace function public.manager_promote_admin(p_email text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare t record;
+begin
+  if not public.is_manager() then raise exception 'Only the manager can add admins.'; end if;
+  select id, role into t from public.profiles where lower(email) = lower(trim(p_email));
+  if not found then
+    raise exception 'No registered account uses that email. Ask them to register first.';
+  end if;
+  if t.role = 'manager' then raise exception 'That account is a manager.'; end if;
+  update public.profiles set role = 'admin', account_status = 'active' where id = t.id;
+  insert into public.notifications(user_id, title, message)
+    values (t.id, 'Welcome, admin', 'You can now review posts and manage events and news.');
+end;
+$$;
+
+-- ---------- public counters (home page) ----------
+create or replace function public.public_stats()
+returns json
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select json_build_object('students',
+    (select count(*) from public.profiles where role = 'student' and account_status = 'active'));
+$$;
+
+-- ---------- notifications: created only by triggers/functions ----------
+drop policy if exists "staff create notifications" on public.notifications;
+revoke update on public.notifications from authenticated;
+grant update (is_read) on public.notifications to authenticated;
+
+-- ---------- function permissions ----------
+revoke all on function public.apply_to_event(bigint, text) from public, anon;
+revoke all on function public.cancel_application(bigint, text) from public, anon;
+revoke all on function public.review_submission(bigint, text, text) from public, anon;
+revoke all on function public.manager_promote_admin(text) from public, anon;
+grant execute on function public.apply_to_event(bigint, text) to authenticated;
+grant execute on function public.cancel_application(bigint, text) to authenticated;
+grant execute on function public.review_submission(bigint, text, text) to authenticated;
+grant execute on function public.manager_promote_admin(text) to authenticated;
+grant execute on function public.public_stats() to anon, authenticated;
+
+-- ---------- realtime (multi-user sync) ----------
+do $$
+declare t text;
+begin
+  foreach t in array array['events','news_posts','event_registrations','volunteer_applications',
+                           'saved_events','event_submissions','notifications','profiles']
+  loop
+    begin
+      execute format('alter publication supabase_realtime add table public.%I', t);
+    exception when duplicate_object then null;
+    end;
+  end loop;
+end $$;
+
+-- ---------- first manager / admins ----------
+-- Promote the first manager once in SQL Editor:
+--   update public.profiles set role = 'manager' where email = 'YOUR_MANAGER_EMAIL';
+-- Admins can then be added from the Manager > Manage Admins page
+-- (the person must register first). Never put a service_role key in browser code.

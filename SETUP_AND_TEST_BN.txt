@@ -1,0 +1,41 @@
+DIU EVENT-X — Full Supabase Integration: Setup ও Final Testing
+================================================================
+
+কোডে যা করা হয়েছে (design/CSS/HTML/logo/color/layout অপরিবর্তিত)
+- Events, Registration, Volunteer, Saved, Submission review, News, Notifications সব এখন Supabase থেকে load/save হয়।
+- LocalStorage থেকে application data সরানো হয়েছে (শুধু dark/light theme browser-এ থাকে)।
+- Realtime + 60s refresh + tab ফিরলে refresh: এক user-এর পরিবর্তন অন্যদের dashboard-এ দেখা যায়।
+- Registration/Volunteer/Review/Role পরিবর্তন সব server-side function ও RLS দিয়ে সুরক্ষিত।
+- Password reset / email confirm link এখন #/hash routing-এর সাথে conflict করে না।
+
+ধাপ ১ — SQL (একবার, আবার চালালেও সমস্যা নেই)
+Supabase > SQL Editor-এ DIU_EVENT_X_Supabase_Setup.sql পুরোটা Run করো।
+
+ধাপ ২ — প্রথম Manager বানাও (SQL Editor)
+  update public.profiles set role = 'manager' where email = 'তোমার_EMAIL';
+Admin বানাতে: Manager হিসেবে login > Manage Admins > Email দাও (ওই ব্যক্তিকে আগে Register করতে হবে)।
+(ওই ফর্মের Password ঘরটি এখন ব্যবহার হয় না; admin নিজের password দিয়েই login করবে।)
+
+ধাপ ৩ — Authentication > URL Configuration
+  Site URL: https://USERNAME.github.io/REPO/   (শেষে / সহ)
+  Redirect URLs: একই URL যোগ করো।
+
+ধাপ ৪ — Email Template (Reset link expiry সমস্যার সমাধান)
+Authentication > Email Templates:
+  Reset Password link:   {{ .SiteURL }}?token_hash={{ .TokenHash }}&type=recovery
+  Confirm signup link:   {{ .SiteURL }}?token_hash={{ .TokenHash }}&type=signup
+(href-এ বসাও। এতে email scanner link "খরচ" করতে পারে না এবং অন্য device-এও link কাজ করে।)
+
+ধাপ ৫ — Custom SMTP (Rate limit স্থায়ী সমাধান)
+Authentication > Emails > SMTP Settings > Enable custom SMTP।
+Brevo / Resend / Gmail App Password যেকোনোটির host, port, username, password দাও।
+তারপর Authentication > Rate Limits থেকে email limit বাড়াও।
+(এটা Supabase dashboard-এর সেটিং; code থেকে করা যায় না।)
+
+Final Testing Checklist
+1. Student: signup > email confirm > login > profile save > register > cancel > save event > submit post
+2. Admin: pending post approve/reject (note সহ), registration approve/reject, event create/edit/publish/unpublish, news
+3. Manager: approved post publish, event delete, student/admin activate-deactivate, reports
+4. দুটি browser/device-এ দুই account: একজনের পরিবর্তন অন্যের dashboard-এ আসে কি না (Refresh ছাড়া)
+5. Student অন্য student-এর data দেখতে পায় না; Student admin URL খুললে redirect হয়
+6. Login, Logout, Forgot password (নতুন email-এর link), Refresh করলে data ঠিক থাকে

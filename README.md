@@ -12,12 +12,12 @@ assets and `style.css` are retained unchanged.
 - Profile updates
 - Supabase password-reset email and password update
 
-## Not fully connected yet
-Events, event registrations/approvals, volunteer applications, saved events,
-event submissions/reviews, news, notifications, admin/manager management,
-and reports still use the original browser-side demo data model. This is not
-a complete multi-user backend or production-ready release. See
-`NEXT_STEPS_BN.txt` and `INTEGRATION_STATUS_BN.txt`.
+## Phase 2 additions
+Events, registrations, volunteer applications, saved events, post review,
+news and notifications now use Supabase tables with Row Level Security and
+realtime sync. See `SETUP_AND_TEST_BN.txt` for the dashboard steps (URL
+configuration, email templates, custom SMTP, first manager) and the final
+test checklist. Re-run `DIU_EVENT_X_Supabase_Setup.sql` once (safe to re-run).
 
 ## Setup
 1. Run `DIU_EVENT_X_Supabase_Setup.sql` once in Supabase SQL Editor.

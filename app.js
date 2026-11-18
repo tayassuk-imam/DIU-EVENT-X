@@ -22,21 +22,6 @@ const ss={
   del(k){delete mem['s:'+k];try{sessionStorage.removeItem(k);}catch(e){}}
 };
 
-/* ================= passwords (salted SHA-256; demo-grade, see notes in footer) ================= */
-async function sha256hex(str){
-  if(window.crypto&&crypto.subtle){
-    const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(str));
-    return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
-  }
-  let h1=0xdeadbeef,h2=0x41c6ce57;
-  for(let i=0;i<str.length;i++){const c=str.charCodeAt(i);h1=Math.imul(h1^c,2654435761);h2=Math.imul(h2^c,1597334677);}
-  h1=Math.imul(h1^(h1>>>16),2246822507)^Math.imul(h2^(h2>>>13),3266489909);
-  h2=Math.imul(h2^(h2>>>16),2246822507)^Math.imul(h1^(h1>>>13),3266489909);
-  return 'f'+(4294967296*(2097151&h2)+(h1>>>0)).toString(16);
-}
-async function hashPw(pw,salt){salt=salt||rand(8);return salt+':'+await sha256hex(salt+':'+pw);}
-async function checkPw(pw,stored){const salt=String(stored).split(':')[0];return (await hashPw(pw,salt))===stored;}
-
 /* ================= dates ================= */
 const pad=n=>String(n).padStart(2,'0');
 const ymd=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
@@ -98,43 +83,124 @@ const LOGO='<img class="logo" src="./diulogo.jpeg" alt="DIU LOGO">';
 const brandText='<span class="bw"><b>DIU <em>EVENT-X</em></b><small>Discover \u2022 Participate \u2022 Grow</small></span>';
 const MARK=LOGO;
 
-/* ================= database (browser only) ================= */
-let db=null;
+/* ================= database (Supabase is the single source of truth) ================= */
 const sb=window.diuEventxSupabase||null;
+const emptyDb=()=>({seq:{},depts:[],cats:[],users:[],students:[],prefs:[],events:[],regs:[],vols:[],saved:[],subs:[],news:[],notes:[],stats:{students:0}});
+let db=emptyDb();
 let authUser=null;
-function localUserForAuth(profile, auth, student, preference){
-  let u=db.users.find(x=>x.auth_id===auth.id);
-  if(!u){u={id:nid('users'),auth_id:auth.id,email:auth.email||'',name:profile.full_name||auth.user_metadata?.full_name||'Student',role:profile.role||'student',status:profile.account_status||'active',created:profile.created_at||new Date().toISOString()};db.users.push(u);}
-  u.auth_id=auth.id;u.email=auth.email||u.email;u.name=profile.full_name||u.name;u.role=profile.role||'student';u.status=profile.account_status||'active';
-  const st=student||{};let row=db.students.find(x=>x.user_id===u.id);
-  if(!row){row={user_id:u.id,student_id:st.student_id||auth.user_metadata?.student_id||''};db.students.push(row);}else if(st.student_id)row.student_id=st.student_id;
-  const pr=preference||{};let pf=db.prefs.find(x=>x.user_id===u.id);
-  if(!pf){pf={user_id:u.id,department_id:st.department_id||null,interests:pr.interests||'',category_id:pr.preferred_category_id||null};db.prefs.push(pf);}else{pf.department_id=st.department_id||pf.department_id;pf.interests=pr.interests??pf.interests;pf.category_id=pr.preferred_category_id||pf.category_id;}
-  save();return u;
+const uidMap=new Map();let uidSeq=0;
+const lid=u=>{if(!u)return null;if(!uidMap.has(u))uidMap.set(u,++uidSeq);return uidMap.get(u);};
+const hhmm=t=>t?String(t).slice(0,5):'';
+const nz=v=>(v===''||v==null)?null:v;
+const must=async p=>{const r=await p;if(r.error)throw r.error;return r.data;};
+async function changed(q){const rows=await must(q.select('id'));if(!rows||!rows.length)throw new Error('Nothing was changed. You may not have permission, or the record no longer exists.');return rows;}
+function niceErr(e){
+  const m=String((e&&e.message)||e||'');
+  if(/student_profiles_student_id|student_id/i.test(m)&&e&&e.code==='23505')return 'That Student ID is already registered.';
+  if(e&&(e.code==='42501'||/row-level security|permission denied/i.test(m)))return 'You do not have permission to do that.';
+  if(e&&e.code==='23505')return 'That record already exists.';
+  if(/over_email_send_rate_limit|rate limit/i.test(m))return 'Too many emails were requested. Please wait a few minutes and try again.';
+  if(/Failed to fetch|NetworkError|Load failed/i.test(m))return 'Network problem. Check your internet connection and try again.';
+  if(e&&(e.code==='PGRST202'||e.code==='42P01'||e.code==='PGRST205'))return 'The database setup is incomplete. Run the latest DIU_EVENT_X_Supabase_Setup.sql in Supabase.';
+  return m||'Something went wrong. Please try again.';
+}
+const mapEvent=r=>({id:r.id,title:r.title,category_id:r.category_id,department_id:r.department_id,organizer:r.organizer||'',description:r.description||'',date:r.event_date,time:hhmm(r.event_time),location:r.location||'',deadline:r.registration_deadline||'',link:r.registration_link||'',type:r.event_type,status:r.status,created_by:lid(r.created_by),created:r.created_at});
+const mapApp=r=>({id:r.id,student_id:lid(r.user_id),event_id:r.event_id,status:r.status,at:r.created_at,reviewed_at:r.reviewed_at});
+const mapSub=r=>({id:r.id,submitter_id:lid(r.submitter_id),event_id:r.event_id,title:r.title,category_id:r.category_id,department_id:r.department_id,organizer:r.organizer||'',description:r.description||'',date:r.event_date,time:hhmm(r.event_time),location:r.location||'',deadline:r.registration_deadline||'',link:r.registration_link||'',status:r.status,reviewed_by:lid(r.reviewed_by),note:r.review_note||'',at:r.created_at,reviewed_at:r.reviewed_at});
+const mapNews=r=>({id:r.id,title:r.title,content:r.content,status:r.status,created_by:lid(r.created_by),at:r.created_at});
+const mapNote=r=>({id:r.id,user_id:lid(r.user_id),title:r.title,message:r.message||'',read:!!r.is_read,at:r.created_at});
+
+let loading=null,loadAgain=false;
+async function loadAll(){
+  if(!sb)throw new Error('Supabase connection is unavailable. Check supabase-config.js and internet access.');
+  if(loading){loadAgain=true;return loading;}
+  loading=(async()=>{
+    do{
+      loadAgain=false;
+      const next=emptyDb();
+      const [d,c,ev,nw,stt]=await Promise.all([
+        sb.from('departments').select('*').order('id'),
+        sb.from('event_categories').select('*').order('id'),
+        sb.from('events').select('*').order('event_date',{ascending:true}).limit(1000),
+        sb.from('news_posts').select('*').order('created_at',{ascending:false}).limit(500),
+        sb.rpc('public_stats')
+      ]);
+      [d,c,ev,nw].forEach(r=>{if(r.error)throw r.error;});
+      next.depts=d.data;next.cats=c.data;next.events=ev.data.map(mapEvent);next.news=nw.data.map(mapNews);
+      if(!stt.error&&stt.data)next.stats.students=Number(stt.data.students)||0;
+      if(authUser){
+        const [pr,sp,pf,rg,vl,sv,sb2,nt]=await Promise.all([
+          sb.from('profiles').select('*').limit(2000),
+          sb.from('student_profiles').select('*').limit(2000),
+          sb.from('student_preferences').select('*').limit(2000),
+          sb.from('event_registrations').select('*').order('created_at',{ascending:false}).limit(2000),
+          sb.from('volunteer_applications').select('*').order('created_at',{ascending:false}).limit(2000),
+          sb.from('saved_events').select('*').limit(1000),
+          sb.from('event_submissions').select('*').order('created_at',{ascending:false}).limit(1000),
+          sb.from('notifications').select('*').order('created_at',{ascending:false}).limit(300)
+        ]);
+        [pr,sp,pf,rg,vl,sv,sb2,nt].forEach(r=>{if(r.error)throw r.error;});
+        const spBy=new Map(sp.data.map(x=>[x.user_id,x])),pfBy=new Map(pf.data.map(x=>[x.user_id,x]));
+        pr.data.forEach(p=>{
+          const id=lid(p.id);
+          next.users.push({id,auth_id:p.id,email:p.email||(authUser&&p.id===authUser.id?authUser.email||'':''),name:p.full_name||'Student',role:p.role,status:p.account_status,created:p.created_at});
+          if(p.role==='student'){
+            const s=spBy.get(p.id),q=pfBy.get(p.id);
+            next.students.push({user_id:id,student_id:s?s.student_id:''});
+            next.prefs.push({user_id:id,department_id:s?s.department_id:null,interests:q?q.interests:'',category_id:q?q.preferred_category_id:null});
+          }
+        });
+        next.regs=rg.data.map(mapApp);next.vols=vl.data.map(mapApp);
+        next.saved=sv.data.map(x=>({id:x.id,student_id:lid(x.user_id),event_id:x.event_id,at:x.created_at}));
+        next.subs=sb2.data.map(mapSub);next.notes=nt.data.map(mapNote);
+      }
+      db=next;
+    }while(loadAgain);
+  })();
+  try{await loading;}finally{loading=null;}
 }
 async function hydrateAuthUser(auth){
   if(!sb||!auth)return null;
-  const {data:pr,error:pe}=await sb.from('profiles').select('*').eq('id',auth.id).maybeSingle();
-  if(pe)throw pe;if(!pr)return null;
-  const [{data:st,error:se},{data:pf,error:pfe}]=await Promise.all([
-    sb.from('student_profiles').select('*').eq('user_id',auth.id).maybeSingle(),
-    sb.from('student_preferences').select('*').eq('user_id',auth.id).maybeSingle()
-  ]);
-  if(se)throw se;if(pfe)throw pfe;
-  // Complete student rows after email confirmation, using signup metadata.
-  if(pr.role==='student'&&!st&&auth.user_metadata?.student_id){
-    const {error}=await sb.from('student_profiles').upsert({user_id:auth.id,student_id:auth.user_metadata.student_id,department_id:auth.user_metadata.department_id||null},{onConflict:'user_id'});
-    if(error)throw error;
-    const {data:st2,error:e2}=await sb.from('student_profiles').select('*').eq('user_id',auth.id).single();if(e2)throw e2;
-    st2 && Object.assign(st||{},st2);
+  const pr=await must(sb.from('profiles').select('*').eq('id',auth.id).maybeSingle());
+  if(!pr)return null;
+  if(pr.role==='student'){
+    const [st,pf]=await Promise.all([
+      must(sb.from('student_profiles').select('user_id').eq('user_id',auth.id).maybeSingle()),
+      must(sb.from('student_preferences').select('user_id').eq('user_id',auth.id).maybeSingle())
+    ]);
+    // Finish student rows after email confirmation using the signup metadata.
+    if(!st&&auth.user_metadata&&auth.user_metadata.student_id)await must(sb.from('student_profiles').upsert({user_id:auth.id,student_id:auth.user_metadata.student_id,department_id:auth.user_metadata.department_id||null},{onConflict:'user_id'}));
+    if(!pf)await must(sb.from('student_preferences').upsert({user_id:auth.id,interests:'',preferred_category_id:null},{onConflict:'user_id'}));
   }
-  if(pr.role==='student'&&!pf){const {error}=await sb.from('student_preferences').upsert({user_id:auth.id,interests:'',preferred_category_id:null},{onConflict:'user_id'});if(error)throw error;}
-  const {data:stFinal}=await sb.from('student_profiles').select('*').eq('user_id',auth.id).maybeSingle();
-  const {data:pfFinal}=await sb.from('student_preferences').select('*').eq('user_id',auth.id).maybeSingle();
-  return localUserForAuth(pr,auth,stFinal||st,pfFinal||pf);
+  authUser=auth;
+  await loadAll();
+  return db.users.find(x=>x.auth_id===auth.id)||null;
 }
-const save=()=>ls.set(KEY,JSON.stringify(db));
-const nid=t=>(db.seq[t]=(db.seq[t]||0)+1);
+async function after(msg){await loadAll();if(msg)toast(msg);render(true);}
+
+/* ---- live sync between users/devices ---- */
+let rt=null,refreshTimer=null,pendingRender=false;
+const SYNC_TABLES=['events','news_posts','event_registrations','volunteer_applications','saved_events','event_submissions','notifications','profiles'];
+function setupRealtime(){
+  if(!sb||typeof sb.channel!=='function')return;
+  try{
+    if(rt){sb.removeChannel(rt);rt=null;}
+    rt=sb.channel('diu-eventx-sync-'+rand(4));
+    SYNC_TABLES.forEach(t=>rt.on('postgres_changes',{event:'*',schema:'public',table:t},scheduleRefresh));
+    rt.subscribe();
+  }catch(err){console.error('Realtime unavailable:',err);}
+}
+function scheduleRefresh(){clearTimeout(refreshTimer);refreshTimer=setTimeout(refreshAndRender,500);}
+async function refreshAndRender(){
+  try{await loadAll();}catch(err){console.error('Refresh failed:',err);return;}
+  softRender();
+}
+const isEditing=()=>{const a=document.activeElement;return !!(a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)&&a.closest('#app'));};
+function softRender(){
+  if(isEditing()||$('#dlg').open){pendingRender=true;return;}
+  pendingRender=false;render(true);
+}
+function flushPending(){setTimeout(()=>{if(pendingRender&&!isEditing()&&!$('#dlg').open){pendingRender=false;render(true);}},250);}
 const cat=id=>db.cats.find(c=>c.id===id);
 const dept=id=>db.depts.find(d=>d.id===id);
 const user=id=>db.users.find(u=>u.id===id);
@@ -146,78 +212,10 @@ const deptName=id=>id?((dept(id)||{}).name||''):'All departments';
 const CATCOLOR={'Event':'#3B6FE0','Seminar':'#8B5CF6','Workshop':'#E07A1F','Volunteer':'#17A673','Competition':'#D9425F','News':'#6B7A90','External Opportunity':'#0E9AA7'};
 const catColor=id=>CATCOLOR[catName(id)]||'#6B7A90';
 
-function notify(uid,title,message){db.notes.push({id:nid('notes'),user_id:uid,title,message,read:false,at:new Date().toISOString()});}
 const unread=uid=>db.notes.filter(n=>n.user_id===uid&&!n.read).length;
 
-async function seed(){
-  const pw=await hashPw('password');
-  const d={v:1,seq:{},depts:[],cats:[],users:[],students:[],prefs:[],events:[],regs:[],vols:[],saved:[],subs:[],news:[],notes:[],otps:[]};
-  const id=t=>(d.seq[t]=(d.seq[t]||0)+1);
-  const at=h=>new Date(Date.now()-h*3600e3).toISOString();
-  ['CSE','SWE','EEE','BBA','Civil','Pharmacy','English','Law','Architecture'].forEach((n,i)=>d.depts.push({id:i+1,name:n}));
-  ['Event','Seminar','Workshop','Volunteer','Competition','News','External Opportunity'].forEach((n,i)=>d.cats.push({id:i+1,name:n}));
-  const addUser=(name,email,role,sid,dep,interests,catId,status)=>{
-    const uid=id('users');
-    d.users.push({id:uid,name,email,pw,role,status:status||'active',created:at(300+uid*20)});
-    if(role==='student'){d.students.push({user_id:uid,student_id:sid});d.prefs.push({user_id:uid,department_id:dep||null,interests:interests||'',category_id:catId||null});}
-    return uid;
-  };
-  addUser('DIU Manager','manager@diueventx.test','manager');
-  addUser('DIU Admin','admin@diueventx.test','admin');
-  addUser('Demo Student','student@diueventx.test','student','DEMO-001',2,'Programming, Hackathon',5);
-  addUser('Ayesha Rahman','ayesha.rahman@diueventx.test','student','232-35-1187',1,'AI, Robotics',3);
-  addUser('Tanvir Hasan','tanvir.hasan@diueventx.test','student','232-15-2044',4,'Startups, Public speaking',1);
-  addUser('Nusrat Jahan','nusrat.jahan@diueventx.test','student','231-35-0932',7,'Writing, Volunteering',4);
-  addUser('Rakib Chowdhury','rakib.chowdhury@diueventx.test','student','231-33-0418',3,'Circuits, Robotics',3,'inactive');
-  const E=(title,c,dp,org,desc,off,time,loc,dl,link,type,status)=>{
-    const eid=id('events');
-    d.events.push({id:eid,title,category_id:c,department_id:dp,organizer:org,description:desc,date:addDays(off),time,location:loc,deadline:dl==null?'':addDays(dl),link:link||'',type:type||'diu',status:status||'published',created_by:1,created:at(200-eid*4)});
-    return eid;
-  };
-  E('DIU Tech Innovation Hackathon',5,2,'DIU Tech Club','Build, learn and compete in a university-wide technology challenge. Teams of three to four get 24 hours to prototype a working product, with mentors from industry on hand.\n\nBring a laptop, a team and a problem worth solving.',12,'10:00','DIU Auditorium',9);
-  E('Career Development Seminar',2,null,'Career Development Center','Career preparation, CV guidance and interview practice with recruiters from leading companies. Open to every department.',7,'14:00','Main Auditorium',5);
-  E('Volunteer Leadership Workshop',4,null,'DIU Volunteer Team','Learn practical volunteer leadership and event coordination skills. Volunteers who complete the workshop are first in line for crew roles at upcoming DIU events.',18,'11:00','DIU Campus',14);
-  E('Inter-University Programming Contest',5,1,'DIU Programming Club','A team contest with problem sets in the ICPC style. Top teams qualify for the regional round. Register your team of three by the deadline.',21,'09:00','Computer Lab Complex',14,'https://example.com/programming-contest');
-  E('Bangladesh Youth Leadership Fellowship',7,null,'Partner NGO (external)','A four-month fellowship for undergraduates with mentoring, a community project and a small stipend. Applications are handled on the organizer\'s own site.',30,'','Online',25,'https://example.com/youth-fellowship','external');
-  E('Startup Pitch Night',1,4,'Entrepreneurship Club','Ten student teams pitch to a panel of founders and investors. Come to watch, vote for the audience prize or register a team of your own.',15,'17:00','Seminar Hall 2',12);
-  E('Circuit Design Workshop',3,3,'EEE Society','A hands-on workshop on schematic capture, PCB layout and testing. Kits are provided for the first 40 registrants.',9,'11:00','EEE Lab 3',7);
-  E('Blood Donation Drive: volunteers needed',4,null,'DIU Red Crescent Youth','Help run registration, guide donors and manage refreshments during the campus blood donation drive. Two shifts available.',5,'09:30','Ground Floor Lobby',3);
-  E('Research Writing Masterclass',3,7,'Department of English','Structure a research paper, write a clear abstract and handle citations. Bring a draft you are working on.',18,'15:00','Room 402',16);
-  E('Legal Aid Awareness Seminar',2,8,'Law Society','Practising lawyers explain how legal aid works in Bangladesh and how students can volunteer at legal aid clinics.',26,'13:00','Room 210',22);
-  E('Green Campus Design Challenge',5,9,'Department of Architecture','Propose a low-energy pavilion for the campus lawn. Submissions are judged on sustainability, buildability and drawing quality.',33,'10:00','Design Studio A',28);
-  E('Pharmacy Community Health Camp',4,6,'Pharmacy Society','Volunteer to run blood pressure checks and health education stalls at a partner community clinic. Training is provided on the day.',11,'10:00','Partner Community Clinic',8);
-  E('Freshers\' Orientation 2026',1,null,'Office of Student Affairs','Welcome session for new students: campus tour, club fair and a meet-and-greet with faculty.',-10,'10:00','Main Auditorium',-12);
-  E('Cloud Computing Bootcamp',3,1,'DIU Tech Club','Three days of hands-on cloud labs. Waiting for final venue confirmation before it is published.',40,'10:00','To be confirmed',34,'','diu','pending');
-  [['Spring Career Fair',2,-35],['Inter-Department Football',1,-52],['AI Workshop Series',3,-70],['Blood Donation Drive (Spring)',4,-93],['Cultural Night',1,-118],['Mid-Term Study Camp',3,-141],['Robotics Expo',5,-165],['Alumni Meetup',1,-190],['Debate Championship',5,-40],['Leadership Talk',2,-80],['Campus Clean-up Day',4,-100]].forEach(x=>E(x[0],x[1],null,'DIU Student Affairs','Past event kept for reporting.',x[2],'10:00','DIU Campus',x[2]-3));
-  const R=(t,s,e,st,h)=>d[t].push({id:id(t),student_id:s,event_id:e,status:st,at:at(h)});
-  R('regs',3,1,'approved',70);R('regs',3,7,'pending',30);R('regs',4,1,'pending',26);R('regs',4,7,'approved',60);R('regs',5,6,'approved',48);R('regs',5,2,'approved',40);R('regs',6,2,'pending',12);R('regs',3,13,'approved',300);
-  R('vols',3,8,'pending',20);R('vols',6,8,'approved',44);R('vols',6,12,'pending',10);R('vols',4,3,'pending',8);
-  d.saved.push({id:id('saved'),student_id:3,event_id:2,at:at(50)},{id:id('saved'),student_id:3,event_id:6,at:at(36)});
-  d.subs.push(
-    {id:id('subs'),submitter_id:3,event_id:null,title:'Cybersecurity Awareness Seminar',category_id:2,department_id:1,organizer:'DIU Cyber Club',description:'An introductory seminar on phishing, password hygiene and safe browsing, led by two security engineers.',date:addDays(20),time:'15:00',location:'Room 505',deadline:addDays(16),link:'',status:'pending',reviewed_by:null,note:'',at:at(5),reviewed_at:null},
-    {id:id('subs'),submitter_id:4,event_id:null,title:'Photography Walk at Ashulia',category_id:1,department_id:null,organizer:'DIU Photography Society',description:'A guided photo walk with a professional photographer. Bring a phone or camera; tips on composition and light included.',date:addDays(24),time:'08:00',location:'Ashulia Lakeside',deadline:addDays(20),link:'',status:'approved',reviewed_by:2,note:'Looks good. Forwarding to the manager for publishing.',at:at(30),reviewed_at:at(18)},
-    {id:id('subs'),submitter_id:5,event_id:null,title:'Weekend Coding Meetup',category_id:1,department_id:1,organizer:'Tanvir Hasan',description:'Casual meetup to code together.',date:addDays(9),time:'',location:'',deadline:'',link:'',status:'rejected',reviewed_by:2,note:'Please add a venue, a start time and a bit more detail about what will happen.',at:at(90),reviewed_at:at(80)}
-  );
-  d.news.push(
-    {id:id('news'),title:'Welcome to DIU EVENT-X',content:'Find DIU events, seminars, competitions, volunteer opportunities and external opportunities in one place. Register for what interests you, save events for later, and post your own for approval.',status:'published',created_by:1,at:at(120)},
-    {id:id('news'),title:'Volunteers wanted for the blood donation drive',content:'The DIU Red Crescent Youth team needs volunteers for two shifts. Apply from the event page and watch your applications for approval.',status:'published',created_by:2,at:at(40)},
-    {id:id('news'),title:'How to get your post approved quickly',content:'Include a clear title, the venue, the start time and a registration deadline. Posts are reviewed by an admin first and then published by the manager.',status:'published',created_by:2,at:at(20)},
-    {id:id('news'),title:'Draft: exam week schedule notes',content:'Internal draft, not yet published.',status:'draft',created_by:2,at:at(4)}
-  );
-  d.notes.push(
-    {id:id('notes'),user_id:3,title:'Welcome to DIU EVENT-X',message:'Browse events, register, volunteer and save what you like.',read:true,at:at(200)},
-    {id:id('notes'),user_id:3,title:'Registration approved',message:'Your registration for DIU Tech Innovation Hackathon was approved.',read:false,at:at(60)},
-    {id:id('notes'),user_id:2,title:'New post to review',message:'Demo Student submitted "Cybersecurity Awareness Seminar".',read:false,at:at(5)}
-  );
-  return d;
-}
-async function loadDb(){
-  try{const raw=ls.get(KEY);if(raw){const d=JSON.parse(raw);if(d&&d.v===1&&Array.isArray(d.events))return d;}}catch(e){}
-  const d=await seed();ls.set(KEY,JSON.stringify(d));return d;
-}
-
 /* ================= shared ui bits ================= */
-const BADGE={pending:['warn','Pending'],approved:['ok','Approved'],rejected:['bad','Rejected'],published:['ok','Published'],active:['ok','Active'],inactive:['bad','Inactive'],draft:['muted','Draft'],awaiting:['info','Awaiting publish']};
+const BADGE={pending:['warn','Pending'],approved:['ok','Approved'],rejected:['bad','Rejected'],published:['ok','Published'],active:['ok','Active'],inactive:['bad','Inactive'],draft:['muted','Draft'],awaiting:['info','Awaiting publish'],cancelled:['muted','Cancelled']};
 const badge=s=>{const b=BADGE[s]||['muted',s];return '<span class="badge b-'+b[0]+'">'+esc(b[1])+'</span>';};
 const subState=s=>s.event_id?'published':(s.status==='approved'?'awaiting':s.status);
 const upcoming=()=>db.events.filter(e=>e.status==='published'&&e.date>=today()).sort((a,b)=>(a.date+(a.time||'99')).localeCompare(b.date+(b.time||'99')));
@@ -247,7 +245,7 @@ function cover(e,h){
 function cardAction(e,u){
   const isVol=catName(e.category_id)==='Volunteer';
   if(u&&u.role==='student'&&regOpen(e)){
-    const reg=db.regs.some(r=>r.student_id===u.id&&r.event_id===e.id),vol=db.vols.some(r=>r.student_id===u.id&&r.event_id===e.id);
+    const reg=db.regs.some(r=>r.student_id===u.id&&r.event_id===e.id&&r.status!=='cancelled'),vol=db.vols.some(r=>r.student_id===u.id&&r.event_id===e.id&&r.status!=='cancelled');
     if(isVol&&!vol)return '<button class="btn btn-outline btn-block" data-act="volunteer" data-id="'+e.id+'">Apply</button>';
     if(!isVol&&!reg)return '<button class="btn btn-outline btn-block" data-act="register" data-id="'+e.id+'">Register</button>';
   }
@@ -282,7 +280,7 @@ function confirmBox(title,msg,ok,danger){
 }
 
 /* ================= session + router ================= */
-const me=()=>{const id=Number(ss.get('uid')||ls.get('uid'));if(!id||!db)return null;const u=user(id);return u&&u.status==='active'?u:null;};
+const me=()=>{if(!authUser)return null;const u=db.users.find(x=>x.auth_id===authUser.id);return u&&u.status==='active'?u:null;};
 const dashPath=r=>({student:'/student',admin:'/admin',manager:'/manager'}[r]||'/');
 const catId=n=>(db.cats.find(c=>c.name===n)||{}).id||0;
 const ROUTES=[];
@@ -335,7 +333,7 @@ function renderTabbar(u,path){
   $('#tabbar').innerHTML=t.map(x=>'<a href="#'+x[0]+'"'+(x[3]?' aria-current="page"':'')+'>'+ic(x[2],22)+'<span>'+x[1]+'</span></a>').join('');
 }
 function renderFoot(){
-  $('#foot').innerHTML='<div class="wrap foot-in">'+brand()+'<p>Demo version: accounts and posts are saved in this browser only.</p><button type="button" data-act="reset-demo">Reset demo data</button></div>';
+  $('#foot').innerHTML='<div class="wrap foot-in">'+brand()+'<p>Live data: accounts, events and posts are saved online and shared across devices.</p><button type="button" data-act="refresh">Refresh data</button></div>';
 }
 
 /* ================= home ================= */
@@ -360,7 +358,7 @@ function vHome(p,q,u){
   const news=db.news.filter(n=>n.status==='published').sort((a,b)=>b.at.localeCompare(a.at)).slice(0,3);
   const tiles=[['Events','/events','calendar','blue'],['Seminars','/events?category='+catId('Seminar'),'mic','violet'],['Competitions','/events?category='+catId('Competition'),'trophy','gold'],['Volunteer','/events?category='+catId('Volunteer'),'users','teal'],['News','/news','doc','violet'],['External','/events?category='+catId('External Opportunity'),'globe','blue']];
   const pubEvents=db.events.filter(e=>e.status==='published');
-  const strip=[[pubEvents.length,'Events','c-blue'],[db.students.length,'Students','c-violet'],[db.depts.length,'Departments','c-teal'],[pubEvents.filter(e=>['Volunteer','External Opportunity'].indexOf(catName(e.category_id))>=0).length,'Opportunities','c-blue']];
+  const strip=[[pubEvents.length,'Events','c-blue'],[db.stats.students,'Students','c-violet'],[db.depts.length,'Departments','c-teal'],[pubEvents.filter(e=>['Volunteer','External Opportunity'].indexOf(catName(e.category_id))>=0).length,'Opportunities','c-blue']];
   return '<section class="hero">'+heroBg()+'<div class="wrap hero-in">'+
    '<h1>All DIU Opportunities in One <span class="grad">Place</span></h1>'+
    '<p class="hero-sub">Find events, seminars, competitions, volunteer opportunities and news \u2014 all in one platform.</p>'+
@@ -403,16 +401,16 @@ function eventActions(e,u){
   const ext=link?'<a class="btn btn-block" href="'+esc(link)+'" target="_blank" rel="noopener noreferrer">'+ic('ext',16)+'Open registration page</a>':'';
   if(!u)return '<a class="btn btn-primary btn-block" href="#/login?next='+encodeURIComponent('/event/'+e.id)+'">Log in to register</a>'+ext+'<p class="hint">New here? <a href="#/register">Create a student account</a>.</p>';
   if(u.role!=='student')return '<p class="hint">You are signed in as '+esc(u.role)+'. Only students can register, volunteer or save events.</p>'+ext;
-  const reg=db.regs.find(r=>r.student_id===u.id&&r.event_id===e.id);
-  const vol=db.vols.find(r=>r.student_id===u.id&&r.event_id===e.id);
+  const reg=db.regs.find(r=>r.student_id===u.id&&r.event_id===e.id&&r.status!=='cancelled');
+  const vol=db.vols.find(r=>r.student_id===u.id&&r.event_id===e.id&&r.status!=='cancelled');
   const sv=db.saved.find(r=>r.student_id===u.id&&r.event_id===e.id);
   const open=regOpen(e);
   let h='';
-  if(reg)h+='<div class="notice ok">'+ic('checkc')+'<div><b>You are registered.</b><br>Status: '+badge(reg.status)+'</div></div>';
+  if(reg)h+='<div class="notice ok">'+ic('checkc')+'<div><b>You are registered.</b><br>Status: '+badge(reg.status)+'</div></div>'+(reg.status!=='rejected'?'<button class="btn btn-block" data-act="cancel" data-kind="registration" data-id="'+e.id+'">Cancel registration</button>':'');
   else if(!open)h+='<button class="btn btn-primary btn-block" disabled>Registration closed</button>';
   else h+='<button class="btn btn-primary btn-block" data-act="register" data-id="'+e.id+'">Register for this event</button>';
   if(catName(e.category_id)==='Volunteer'){
-    if(vol)h+='<div class="notice ok">'+ic('heart')+'<div><b>Volunteer application sent.</b><br>Status: '+badge(vol.status)+'</div></div>';
+    if(vol)h+='<div class="notice ok">'+ic('heart')+'<div><b>Volunteer application sent.</b><br>Status: '+badge(vol.status)+'</div></div>'+(vol.status!=='rejected'?'<button class="btn btn-block" data-act="cancel" data-kind="volunteer" data-id="'+e.id+'">Cancel application</button>':'');
     else if(open)h+='<button class="btn btn-outline btn-block" data-act="volunteer" data-id="'+e.id+'">'+ic('heart',16)+'Apply as volunteer</button>';
   }
   h+='<button class="btn btn-block" data-act="save" data-id="'+e.id+'" aria-pressed="'+(sv?'true':'false')+'">'+ic('bookmark',16)+(sv?'Saved. Remove from saved':'Save for later')+'</button>'+ext;
@@ -473,7 +471,7 @@ function vRegister(p,q,u){
 }
 route('/forgot',vForgot);
 function vForgot(){
-  return authShell('<h1>Forgot password</h1><p class="muted">Enter the email you registered with. We will generate a 6-digit code that expires in 10 minutes.</p>'+
+  return authShell('<h1>Forgot password</h1><p class="muted">Enter the email you registered with. We will email you a secure link to set a new password. Open only the newest email.</p>'+
    '<form data-form="forgot" novalidate>'+msgBox+'<div class="field"><label for="f-email">Email</label>'+inp('mail','f-email','email','email','Email address','autocomplete="email" required')+'</div><button class="btn btn-primary btn-block btn-lg">Send verification code</button></form>','<a href="#/login">Back to log in</a>');
 }
 route('/verify',vVerify);
@@ -486,7 +484,7 @@ function vVerify(){
 }
 route('/reset',vReset);
 function vReset(){
-  if(!ss.get('reset_uid'))return {redirect:'/forgot'};
+  if(!ss.get('recovery'))return {redirect:'/forgot'};
   return authShell('<h1>Create a new password</h1><p class="muted">Choose a password with at least 8 characters.</p>'+
    '<form data-form="reset" novalidate>'+msgBox+'<div class="field"><label for="p-pw">New password</label>'+inp('lock','p-pw','password','password','New password','minlength="8" autocomplete="new-password" required',true)+'</div>'+
    '<div class="field"><label for="p-pw2">Confirm password</label>'+inp('lock','p-pw2','confirm_password','password','Repeat the password','autocomplete="new-password" required')+'</div><button class="btn btn-primary btn-block btn-lg">Update password</button></form>');
@@ -524,7 +522,7 @@ const secHead=(t,link)=>'<div class="sec-head"><h2>'+t+'</h2>'+(link||'')+'</div
 function recommend(u){
   const p=pref(u.id)||{};
   const words=(p.interests||'').toLowerCase().split(/[,;\n]+/).map(s=>s.trim()).filter(s=>s.length>=3);
-  const joined=new Set(db.regs.filter(r=>r.student_id===u.id).map(r=>r.event_id));
+  const joined=new Set(db.regs.filter(r=>r.student_id===u.id&&r.status!=='cancelled').map(r=>r.event_id));
   return upcoming().filter(e=>!joined.has(e.id)&&regOpen(e)).map(e=>{
     let score=0;const why=[];
     if(p.department_id&&e.department_id===p.department_id){score+=3;why.push('Your department: '+deptName(e.department_id));}
@@ -545,7 +543,7 @@ function vStuDash(p,q,u){
   const more=upcoming().filter(e=>!recIds.has(e.id)).slice(0,3);
   const notes=db.notes.filter(n=>n.user_id===u.id).sort((a,b)=>b.at.localeCompare(a.at)).slice(0,3);
   return dash(u,'/student','Welcome back, '+u.name.split(' ')[0]+'! \uD83D\uDC4B','Explore new opportunities and make the most of your university life.',
-   '<div class="stats s3">'+stat('Registered Events',db.regs.filter(r=>r.student_id===u.id).length,'calendar','violet')+stat('Volunteer Applications',db.vols.filter(r=>r.student_id===u.id).length,'bookmark','mint')+stat('Saved Events',db.saved.filter(r=>r.student_id===u.id).length,'heart','violet')+'</div>'+
+   '<div class="stats s3">'+stat('Registered Events',db.regs.filter(r=>r.student_id===u.id&&r.status!=='cancelled').length,'calendar','violet')+stat('Volunteer Applications',db.vols.filter(r=>r.student_id===u.id&&r.status!=='cancelled').length,'bookmark','mint')+stat('Saved Events',db.saved.filter(r=>r.student_id===u.id).length,'heart','violet')+'</div>'+
    '<div class="blk">'+secHead('Recommended for You','<a class="link" href="#/events">See All</a>')+(reco.length?'<div class="egrid">'+reco.map(x=>ecard(x.e,x.why[0])).join('')+'</div>':'<div class="empty"><h3>No matches yet</h3><p>Add your interests and preferred category in your profile to get suggestions.</p><a class="btn" href="#/student/profile">Update profile</a></div>')+'</div>'+
    (more.length?'<div class="blk">'+secHead('More upcoming events','<a class="link" href="#/events">See All</a>')+'<div class="egrid">'+more.map(e=>ecard(e)).join('')+'</div></div>':'')+
    '<div class="blk">'+secHead('Recent notifications')+noteList(notes)+'</div>');
@@ -673,7 +671,7 @@ function eventsPage(u,path,q,opt){
    '<div class="tabs">'+tabs.map(t=>'<a href="#'+path+(t[0]?'?status='+t[0]:'')+'"'+(f===t[0]?' aria-current="page"':'')+'>'+t[1]+'</a>').join('')+'</div>'+
    table(['Event','Category','Date','Source','Status','Actions'],list.map(e=>[
      '<b>'+esc(e.title)+'</b><span class="sub">'+esc(e.organizer)+'</span>','<span class="ty" style="color:'+catText(e.category_id)+'">'+esc(catName(e.category_id))+'</span>',fmtShort(e.date),e.type==='external'?'External':'DIU',badge(e.status),
-     '<a class="btn btn-sm" href="#/event/'+e.id+'">'+ic('eye',14)+'View</a><button class="btn btn-sm" data-act="ev-edit" data-id="'+e.id+'">'+ic('edit',14)+'Edit</button>'+(e.status!=='published'?'<button class="btn btn-sm btn-primary" data-act="ev-publish" data-id="'+e.id+'">Publish</button>':'')+(isMgr?'<button class="btn btn-sm" data-act="ev-delete" data-id="'+e.id+'" aria-label="Delete '+esc(e.title)+'">'+ic('trash',14)+'</button>':'')
+     '<a class="btn btn-sm" href="#/event/'+e.id+'">'+ic('eye',14)+'View</a><button class="btn btn-sm" data-act="ev-edit" data-id="'+e.id+'">'+ic('edit',14)+'Edit</button>'+(e.status!=='published'?'<button class="btn btn-sm btn-primary" data-act="ev-publish" data-id="'+e.id+'">Publish</button>':'<button class="btn btn-sm" data-act="ev-unpublish" data-id="'+e.id+'">Unpublish</button>')+(isMgr?'<button class="btn btn-sm" data-act="ev-delete" data-id="'+e.id+'" aria-label="Delete '+esc(e.title)+'">'+ic('trash',14)+'</button>':'')
    ]),'No events here yet'));
 }
 function applicationsPage(u,path,q,opt){
@@ -683,7 +681,7 @@ function applicationsPage(u,path,q,opt){
   return dash(u,path,opt.title,opt.sub,
    '<div class="tabs">'+[['','All ('+all.length+')'],['pending','Pending'],['approved','Approved'],['rejected','Rejected']].map(t=>'<a href="#'+path+(t[0]?'?status='+t[0]:'')+'"'+(f===t[0]?' aria-current="page"':'')+'>'+t[1]+'</a>').join('')+'</div>'+
    table(['Student','Event','Event date','Applied','Status','Actions'],list.map(r=>{const e=evt(r.event_id);return [who(r.student_id),evLink(e),e?fmtShort(e.date):'',fmtStamp(r.at),badge(r.status),
-     (r.status!=='approved'?'<button class="btn btn-sm btn-primary" data-act="app-set" data-type="'+type+'" data-id="'+r.id+'" data-status="approved">Approve</button>':'')+(r.status!=='rejected'?'<button class="btn btn-sm" data-act="app-set" data-type="'+type+'" data-id="'+r.id+'" data-status="rejected">Reject</button>':'')];}),'No applications match'));
+     (r.status==='cancelled'?'':r.status!=='approved'?'<button class="btn btn-sm btn-primary" data-act="app-set" data-type="'+type+'" data-id="'+r.id+'" data-status="approved">Approve</button>':'')+(r.status==='cancelled'?'':r.status!=='rejected'?'<button class="btn btn-sm" data-act="app-set" data-type="'+type+'" data-id="'+r.id+'" data-status="rejected">Reject</button>':'')];}),'No applications match'));
 }
 function newsPage(u,path){
   const list=db.news.slice().sort((a,b)=>b.at.localeCompare(a.at));
@@ -784,7 +782,7 @@ function vAdmins(p,q,u){
 route('/manager/reports',vReports,['manager']);
 function vReports(p,q,u){
   const cnt=(a,s)=>a.filter(r=>r.status===s).length;
-  const perEvent=db.events.map(e=>({label:e.title,value:db.regs.filter(r=>r.event_id===e.id).length})).filter(x=>x.value>0).sort((a,b)=>b.value-a.value).slice(0,6);
+  const perEvent=db.events.map(e=>({label:e.title,value:db.regs.filter(r=>r.event_id===e.id&&r.status!=='cancelled').length})).filter(x=>x.value>0).sort((a,b)=>b.value-a.value).slice(0,6);
   const perCat=db.cats.map(c=>({label:c.name,value:db.events.filter(e=>e.status==='published'&&e.category_id===c.id).length}));
   const perDept=db.depts.map(d=>({label:d.name,value:db.prefs.filter(pf=>pf.department_id===d.id&&(user(pf.user_id)||{}).role==='student').length}));
   return dash(u,'/manager/reports','Reports','Registrations, events and students at a glance.',
@@ -803,19 +801,27 @@ const emailOk=s=>/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s);
 F.search=(f,fd)=>{const s=val(fd,'q');go('/events'+(s?'?q='+encodeURIComponent(s):''));};
 F.filters=(f,fd)=>{const p=new URLSearchParams();['q','department','category','type'].forEach(k=>{const v=val(fd,k);if(v&&v!=='0')p.set(k,v);});const s=p.toString();go('/events'+(s?'?'+s:''));};
 
+const redirectBase=()=>location.origin+location.pathname;
+const cooldownLeft=(key,sec)=>{const last=+ss.get(key)||0;const left=Math.ceil((last+sec*1000-Date.now())/1000);return left>0?left:0;};
+
 F.login=async(f,fd)=>{
   const email=val(fd,'email').toLowerCase(),pw=String(fd.get('password')||'');
   if(!email||!pw)return formError(f,'Enter your email and password.');
   if(!sb)return formError(f,'Supabase connection is unavailable. Check supabase-config.js and internet access.');
   const {data,error}=await sb.auth.signInWithPassword({email,password:pw});
-  if(error){const n=(+ss.get('attempts')||0)+1;ss.set('attempts',String(n));return formError(f,n>=3?'Login failed. Check your email/password or reset your password.':'Email or password is incorrect. Attempt '+n+' of 3.');}
+  if(error){
+    if(/not confirmed/i.test(error.message))return formError(f,'Please confirm your email first. Open the confirmation email we sent, then log in.');
+    const n=(+ss.get('attempts')||0)+1;ss.set('attempts',String(n));
+    return formError(f,n>=3?'Login failed. Check your email/password or reset your password.':'Email or password is incorrect. Attempt '+n+' of 3.');
+  }
   try{
-    const u=await hydrateAuthUser(data.user);if(!u)throw new Error('Your profile was not created. Run the supplied Supabase SQL setup and check the signup trigger.');
-    if(u.status!=='active'){await sb.auth.signOut();return formError(f,'This account is inactive. Ask the DIU EVENT-X manager.');}
-    ss.set('attempts','0');ss.set('uid',String(u.id));ls.del('uid');
+    const u=await hydrateAuthUser(data.user);
+    if(!u)throw new Error('Your profile was not created. Run the supplied Supabase SQL setup and check the signup trigger.');
+    if(u.status!=='active'){await sb.auth.signOut();authUser=null;await loadAll();return formError(f,'This account is inactive. Ask the DIU EVENT-X manager.');}
+    ss.set('attempts','0');setupRealtime();
     const next=new URLSearchParams((location.hash.split('?')[1])||'').get('next');
     toast('Welcome back, '+u.name.split(' ')[0]+'.');go(next&&next.charAt(0)==='/'&&next.charAt(1)!=='/'?next:dashPath(u.role));
-  }catch(err){console.error(err);formError(f,err.message||'Could not load your Supabase profile.');}
+  }catch(err){console.error(err);formError(f,niceErr(err));}
 };
 F.register=async(f,fd)=>{
   const name=val(fd,'name'),sid=val(fd,'student_id'),email=val(fd,'email').toLowerCase(),dp=+fd.get('department_id'),pw=String(fd.get('password')||''),c=String(fd.get('confirm_password')||'');
@@ -824,63 +830,64 @@ F.register=async(f,fd)=>{
   if(pw.length<8)return formError(f,'Your password needs at least 8 characters.');
   if(pw!==c)return formError(f,'The two passwords do not match.');
   if(!sb)return formError(f,'Supabase connection is unavailable. Check configuration and internet access.');
-  const {data,error}=await sb.auth.signUp({email,password:pw,options:{data:{full_name:name,student_id:sid,department_id:dp},emailRedirectTo:location.origin+location.pathname}});
-  if(error)return formError(f,error.message);
-  if(data.user && data.session){
-    try{await hydrateAuthUser(data.user);const {error:spErr}=await sb.from('student_profiles').upsert({user_id:data.user.id,student_id:sid,department_id:dp},{onConflict:'user_id'});if(spErr)throw spErr;const {error:pfErr}=await sb.from('student_preferences').upsert({user_id:data.user.id,interests:'',preferred_category_id:null},{onConflict:'user_id'});if(pfErr)throw pfErr;}
-    catch(err){console.error(err);return formError(f,'Account created, but student details could not be saved: '+err.message);}
-    toast('Account created successfully. You can now log in.');go('/login');
+  const wait=cooldownLeft('mail_at',45);if(wait)return formError(f,'Please wait '+wait+' seconds before trying again.');
+  const {data,error}=await sb.auth.signUp({email,password:pw,options:{data:{full_name:name,student_id:sid,department_id:dp},emailRedirectTo:redirectBase()}});
+  if(error){if(/rate limit/i.test(error.message))ss.set('mail_at',String(Date.now()));return formError(f,niceErr(error));}
+  if(data.user&&Array.isArray(data.user.identities)&&data.user.identities.length===0)return formError(f,'This email is already registered. Log in, or reset your password.');
+  if(data.user&&data.session){
+    try{
+      const sp=await sb.from('student_profiles').upsert({user_id:data.user.id,student_id:sid,department_id:dp},{onConflict:'user_id'});if(sp.error)throw sp.error;
+      const pf=await sb.from('student_preferences').upsert({user_id:data.user.id,interests:'',preferred_category_id:null},{onConflict:'user_id'});if(pf.error)throw pf.error;
+      await hydrateAuthUser(data.user);setupRealtime();
+    }catch(err){console.error(err);return formError(f,'Account created, but student details could not be saved: '+niceErr(err));}
+    toast('Account created successfully.');go('/login');
   }else{
+    ss.set('mail_at',String(Date.now()));
     toast('Registration submitted. Check your email to confirm your account, then log in.');go('/login');
   }
 };
 F.forgot=async(f,fd)=>{
   const email=val(fd,'email').toLowerCase();if(!email)return formError(f,'Enter your email address.');
   if(!sb)return formError(f,'Supabase connection is unavailable.');
-  const {error}=await sb.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname+'#/' });
-  if(error)return formError(f,error.message);
-  toast('Password reset email sent. Check your inbox and spam folder.');go('/login');
-};
-F.verify=async(f,fd)=>{
-  const email=ss.get('reset_email'),code=val(fd,'otp');
-  const u=db.users.find(x=>x.email===email);if(!u)return formError(f,'Start again from Forgot password.');
-  const row=db.otps.filter(o=>o.user_id===u.id&&!o.used&&o.expires>Date.now()).pop();
-  if(!row)return formError(f,'That code is invalid or expired. Request a new one.');
-  if(!/^\d{6}$/.test(code))return formError(f,'Enter the 6-digit code.');
-  if(await checkPw(code,row.hash)){row.used=true;save();ss.set('reset_uid',String(u.id));ss.del('demo_otp');go('/reset');return;}
-  row.tries=(row.tries||0)+1;if(row.tries>=5)row.used=true;save();
-  formError(f,row.tries>=5?'Too many wrong codes. Request a new code.':'That code is invalid or expired.');
+  const wait=cooldownLeft('mail_at',60);if(wait)return formError(f,'An email was just requested. Please wait '+wait+' seconds before asking for another one.');
+  const {error}=await sb.auth.resetPasswordForEmail(email,{redirectTo:redirectBase()});
+  if(error){if(/rate limit/i.test(error.message))ss.set('mail_at',String(Date.now()));return formError(f,niceErr(error));}
+  ss.set('mail_at',String(Date.now()));
+  toast('If that email has an account, a reset link is on its way. Open the newest email only.');go('/login');
 };
 F.reset=async(f,fd)=>{
   const pw=String(fd.get('password')||''),c=String(fd.get('confirm_password')||'');
   if(pw.length<8)return formError(f,'Your password needs at least 8 characters.');
   if(pw!==c)return formError(f,'The two passwords do not match.');
-  if(sb){const {data:{user:au}}=await sb.auth.getUser();if(!au)return formError(f,'Open the password-reset link from your email first.');const {error}=await sb.auth.updateUser({password:pw});if(error)return formError(f,error.message);['reset_uid','reset_email','demo_otp','attempts'].forEach(k=>ss.del(k));toast('Password updated. Log in with your new password.');go('/login');return;}
-  const u=user(Number(ss.get('reset_uid')));if(!u)return formError(f,'Start again from Forgot password.');
-  u.pw=await hashPw(pw);save();
-  ['reset_uid','reset_email','demo_otp','attempts'].forEach(k=>ss.del(k));
+  if(!sb)return formError(f,'Supabase connection is unavailable.');
+  const {data:{session}}=await sb.auth.getSession();
+  if(!session)return formError(f,'This reset link has expired or was already used. Request a new link from Forgot password.');
+  const {error}=await sb.auth.updateUser({password:pw});
+  if(error)return formError(f,niceErr(error));
+  ['recovery','attempts'].forEach(k=>ss.del(k));
+  await sb.auth.signOut();authUser=null;
   toast('Password updated. Log in with your new password.');go('/login');
 };
 F.profile=async(f,fd)=>{
   const u=need('student');if(!u)return;
   const name=val(fd,'name');if(!name)return formError(f,'Your name cannot be empty.');
-  u.name=name;const pf=pref(u.id);
-  pf.department_id=+fd.get('department_id')||null;pf.interests=val(fd,'interests');pf.category_id=+fd.get('category_id')||null;
-  save();if(sb&&u.auth_id){const [{error:e1},{error:e2}]=await Promise.all([sb.from('profiles').update({full_name:name}).eq('id',u.auth_id),sb.from('student_profiles').upsert({user_id:u.auth_id,department_id:pf.department_id},{onConflict:'user_id'})]);if(e1||e2)return formError(f,(e1||e2).message);const {error:e3}=await sb.from('student_preferences').upsert({user_id:u.auth_id,interests:pf.interests,preferred_category_id:pf.category_id},{onConflict:'user_id'});if(e3)return formError(f,e3.message);}toast('Profile saved.');render(true);
+  const dep=+fd.get('department_id')||null,ints=val(fd,'interests'),catv=+fd.get('category_id')||null;
+  await changed(sb.from('profiles').update({full_name:name}).eq('id',u.auth_id));
+  await changed(sb.from('student_profiles').update({department_id:dep}).eq('user_id',u.auth_id));
+  await must(sb.from('student_preferences').upsert({user_id:u.auth_id,interests:ints,preferred_category_id:catv},{onConflict:'user_id'}));
+  await after('Profile saved.');
 };
-F.submit=(f,fd)=>{
+F.submit=async(f,fd)=>{
   const u=need('student');if(!u)return;
   const v={title:val(fd,'title'),category_id:+fd.get('category_id'),department_id:+fd.get('department_id')||null,organizer:val(fd,'organizer'),description:val(fd,'description'),date:val(fd,'event_date'),time:val(fd,'event_time'),location:val(fd,'location'),deadline:val(fd,'registration_deadline'),link:val(fd,'registration_link')};
   if(!v.title||!v.organizer||!v.description||!v.date)return formError(f,'Event name, organizer, description and date are required.');
   if(v.date<today())return formError(f,'The event date cannot be in the past.');
   if(v.deadline&&v.deadline>v.date)return formError(f,'The registration deadline must be on or before the event date.');
   if(v.link&&!safeUrl(v.link))return formError(f,'The registration link must start with http:// or https://.');
-  db.subs.push(Object.assign({id:nid('subs'),submitter_id:u.id,event_id:null,status:'pending',reviewed_by:null,note:'',at:new Date().toISOString(),reviewed_at:null},v));
-  db.users.filter(x=>x.role==='admin'&&x.status==='active').forEach(a=>notify(a.id,'New post to review',u.name+' submitted "'+v.title+'".'));
-  notify(u.id,'Post submitted','"'+v.title+'" is waiting for admin review.');
-  save();toast('Submitted for approval.');render(true);
+  await must(sb.from('event_submissions').insert({submitter_id:u.auth_id,title:v.title,category_id:v.category_id,department_id:v.department_id,organizer:v.organizer,description:v.description,event_date:v.date,event_time:nz(v.time),location:v.location,registration_deadline:nz(v.deadline),registration_link:v.link}));
+  await after('Submitted for approval.');
 };
-F.event=(f,fd)=>{
+F.event=async(f,fd)=>{
   const u=need('admin','manager');if(!u)return;
   const id=+f.dataset.id;
   const v={title:val(fd,'title'),category_id:+fd.get('category_id'),department_id:+fd.get('department_id')||null,organizer:val(fd,'organizer'),type:fd.get('type')==='external'?'external':'diu',date:val(fd,'date'),time:val(fd,'time'),location:val(fd,'location'),deadline:val(fd,'deadline'),link:val(fd,'link'),status:val(fd,'status'),description:val(fd,'description')};
@@ -888,91 +895,99 @@ F.event=(f,fd)=>{
   if(v.deadline&&v.deadline>v.date)return formError(f,'The registration deadline must be on or before the event date.');
   if(v.link&&!safeUrl(v.link))return formError(f,'The registration link must start with http:// or https://.');
   if(['published','pending','approved','rejected'].indexOf(v.status)<0)v.status='pending';
-  if(id){const e=evt(id);if(!e)return formError(f,'This event no longer exists.');Object.assign(e,v);}
-  else db.events.push(Object.assign({id:nid('events'),created_by:u.id,created:new Date().toISOString()},v));
-  save();closeDlg();toast(id?'Event updated.':'Event created.');render(true);
+  const row={title:v.title,category_id:v.category_id,department_id:v.department_id,organizer:v.organizer,description:v.description,event_date:v.date,event_time:nz(v.time),location:v.location,registration_deadline:nz(v.deadline),registration_link:v.link,event_type:v.type,status:v.status};
+  if(id)await changed(sb.from('events').update(row).eq('id',id));
+  else await must(sb.from('events').insert(Object.assign({created_by:u.auth_id},row)));
+  closeDlg();await after(id?'Event updated.':'Event created.');
 };
-F.reject=(f,fd)=>{
+F.reject=async(f,fd)=>{
   const u=need('admin','manager');if(!u)return;
-  const s=db.subs.find(x=>x.id===+f.dataset.id);if(!s)return;
   const note=val(fd,'note');if(note.length<3)return formError(f,'Add a short note so the student knows what to fix.');
-  s.status='rejected';s.reviewed_by=u.id;s.reviewed_at=new Date().toISOString();s.note=note;
-  notify(s.submitter_id,'Post rejected','"'+s.title+'" was rejected. Note: '+note);
-  save();closeDlg();toast('Post rejected.');render(true);
+  await must(sb.rpc('review_submission',{p_id:+f.dataset.id,p_action:'reject',p_note:note}));
+  closeDlg();await after('Post rejected.');
 };
-F.news=(f,fd)=>{
+F.news=async(f,fd)=>{
   const u=need('admin','manager');if(!u)return;
   const t=val(fd,'title'),c=val(fd,'content');if(!t||!c)return formError(f,'Add a title and some content.');
-  db.news.push({id:nid('news'),title:t,content:c,status:fd.get('status')==='draft'?'draft':'published',created_by:u.id,at:new Date().toISOString()});
-  save();toast(fd.get('status')==='draft'?'Saved as draft.':'News published.');render(true);
+  const st=fd.get('status')==='draft'?'draft':'published';
+  await must(sb.from('news_posts').insert({title:t,content:c,status:st,created_by:u.auth_id}));
+  await after(st==='draft'?'Saved as draft.':'News published.');
 };
 F['admin-add']=async(f,fd)=>{
   const u=need('manager');if(!u)return;
-  const name=val(fd,'name'),email=val(fd,'email').toLowerCase(),pw=String(fd.get('password')||'');
+  const name=val(fd,'name'),email=val(fd,'email').toLowerCase();
   if(db.users.filter(x=>x.role==='admin'&&x.status==='active').length>=3)return formError(f,'Maximum admin limit reached. Deactivate an active admin first.');
   if(!name||!emailOk(email))return formError(f,'Enter a name and a valid email.');
-  if(pw.length<8)return formError(f,'The starting password needs at least 8 characters.');
-  if(db.users.some(x=>x.email===email))return formError(f,'That email already has an account.');
-  const uid=nid('users');db.users.push({id:uid,name,email,pw:await hashPw(pw),role:'admin',status:'active',created:new Date().toISOString()});
-  notify(uid,'Welcome, admin','You can now review posts and manage events and news.');save();toast('Admin added.');render(true);
+  await must(sb.rpc('manager_promote_admin',{p_email:email}));
+  await after('Admin added.');
 };
-
-
-F['settings-name']=(f,fd)=>{
+F['settings-name']=async(f,fd)=>{
   const u=need('student','admin','manager');if(!u)return;
   const name=val(fd,'name');if(!name)return formError(f,'Your name cannot be empty.');
-  u.name=name;save();toast('Name saved.');render(true);
+  await changed(sb.from('profiles').update({full_name:name}).eq('id',u.auth_id));
+  await after('Name saved.');
 };
 F.password=async(f,fd)=>{
   const u=need('student','admin','manager');if(!u)return;
   const cur=String(fd.get('current')||''),pw=String(fd.get('password')||''),c=String(fd.get('confirm_password')||'');
-  if(!await checkPw(cur,u.pw))return formError(f,'Your current password is not correct.');
   if(pw.length<8)return formError(f,'Your new password needs at least 8 characters.');
   if(pw!==c)return formError(f,'The two new passwords do not match.');
-  u.pw=await hashPw(pw);save();toast('Password updated.');render(true);
+  const chk=await sb.auth.signInWithPassword({email:u.email,password:cur});
+  if(chk.error)return formError(f,'Your current password is not correct.');
+  const {error}=await sb.auth.updateUser({password:pw});
+  if(error)return formError(f,niceErr(error));
+  toast('Password updated.');render(true);
 };
 
 /* ================= click actions ================= */
 const A={};
 A.menu=el=>{const n=$('#nav');const o=n.classList.toggle('open');el.setAttribute('aria-expanded',o?'true':'false');};
-A.logout=async()=>{if(sb)await sb.auth.signOut();authUser=null;ss.del('uid');ls.del('uid');toast('You are logged out.');go('/');};
+A.logout=async()=>{
+  if(sb)await sb.auth.signOut();
+  authUser=null;ss.del('recovery');
+  try{await loadAll();}catch(e){console.error(e);}
+  setupRealtime();toast('You are logged out.');go('/');
+};
 A['dlg-close']=()=>closeDlg();
 A.demo=el=>{
   const em={student:'student@diueventx.test',admin:'admin@diueventx.test',manager:'manager@diueventx.test'}[el.dataset.role];
   $('#l-email').value=em;$('#l-pw').value='password';$('#l-pw').focus();
 };
-A['reset-demo']=async()=>{
-  if(!await confirmBox('Reset demo data?','This removes every account, post and registration you created here and restores the sample data.','Reset',true))return;
-  ls.del(KEY);ls.del('uid');['uid','attempts','reset_email','reset_uid','demo_otp'].forEach(k=>ss.del(k));
-  db=await loadDb();toast('Demo data restored.');go('/');render();
-};
-A.register=(el,id)=>{
+A.refresh=async()=>{await after('Data refreshed.');};
+A.register=async(el,id)=>{
   const u=need('student');if(!u)return;const e=evt(id);
   if(!e||e.status!=='published')return;
   if(!regOpen(e))return toast('Registration for this event is closed.','danger');
-  if(db.regs.some(r=>r.student_id===u.id&&r.event_id===id))return;
-  db.regs.push({id:nid('regs'),student_id:u.id,event_id:id,status:'pending',at:new Date().toISOString()});
-  notify(u.id,'Registration submitted','Your registration for "'+e.title+'" is pending approval.');save();
-  toast('Registration submitted.');render(true);
+  if(db.regs.some(r=>r.student_id===u.id&&r.event_id===id&&r.status!=='cancelled'))return;
+  await must(sb.rpc('apply_to_event',{p_event_id:id,p_kind:'registration'}));
+  await after('Registration submitted.');
 };
-A.volunteer=(el,id)=>{
+A.volunteer=async(el,id)=>{
   const u=need('student');if(!u)return;const e=evt(id);
   if(!e||e.status!=='published'||catName(e.category_id)!=='Volunteer')return;
   if(!regOpen(e))return toast('Applications for this role are closed.','danger');
-  if(db.vols.some(r=>r.student_id===u.id&&r.event_id===id))return;
-  db.vols.push({id:nid('vols'),student_id:u.id,event_id:id,status:'pending',at:new Date().toISOString()});
-  notify(u.id,'Volunteer application submitted','Your application for "'+e.title+'" is pending approval.');save();
-  toast('Volunteer application submitted.');render(true);
+  if(db.vols.some(r=>r.student_id===u.id&&r.event_id===id&&r.status!=='cancelled'))return;
+  await must(sb.rpc('apply_to_event',{p_event_id:id,p_kind:'volunteer'}));
+  await after('Volunteer application submitted.');
 };
-A.save=(el,id)=>{
+A.cancel=async(el,id)=>{
   const u=need('student');if(!u)return;
-  const i=db.saved.findIndex(r=>r.student_id===u.id&&r.event_id===id);
-  if(i>=0){db.saved.splice(i,1);toast('Removed from saved events.');}
-  else{db.saved.push({id:nid('saved'),student_id:u.id,event_id:id,at:new Date().toISOString()});toast('Event saved.');}
-  save();render(true);
+  const kind=el.dataset.kind==='volunteer'?'volunteer':'registration';
+  if(!await confirmBox(kind==='volunteer'?'Cancel your volunteer application?':'Cancel your registration?','You can apply again later while applications are still open.','Yes, cancel',true))return;
+  await must(sb.rpc('cancel_application',{p_event_id:id,p_kind:kind}));
+  await after(kind==='volunteer'?'Volunteer application cancelled.':'Registration cancelled.');
 };
-A['note-read']=(el,id)=>{const u=me();const n=db.notes.find(x=>x.id===id&&u&&x.user_id===u.id);if(n){n.read=true;save();render(true);}};
-A['note-read-all']=()=>{const u=me();if(!u)return;db.notes.forEach(n=>{if(n.user_id===u.id)n.read=true;});save();render(true);};
+A.save=async(el,id)=>{
+  const u=need('student');if(!u)return;
+  const ex=db.saved.find(r=>r.student_id===u.id&&r.event_id===id);
+  if(ex){await must(sb.from('saved_events').delete().eq('id',ex.id));await after('Removed from saved events.');}
+  else{
+    try{await must(sb.from('saved_events').insert({user_id:u.auth_id,event_id:id}));}catch(e){if(!e||e.code!=='23505')throw e;}
+    await after('Event saved.');
+  }
+};
+A['note-read']=async(el,id)=>{if(!me())return;await must(sb.from('notifications').update({is_read:true}).eq('id',id));await after();};
+A['note-read-all']=async()=>{const u=me();if(!u)return;await must(sb.from('notifications').update({is_read:true}).eq('user_id',u.auth_id).eq('is_read',false));await after();};
 A['sub-view']=(el,id)=>{
   const u=need('admin','manager');if(!u)return;const s=db.subs.find(x=>x.id===id);if(!s)return;
   const can=u.role==='manager'?(s.status==='pending'||subState(s)==='awaiting'):s.status==='pending';
@@ -983,60 +998,64 @@ A['sub-reject']=(el,id)=>{
   if(s.event_id||s.status==='rejected')return;
   openDlg(rejectFormHtml(id));
 };
-A['sub-approve']=(el,id)=>{
+A['sub-approve']=async(el,id)=>{
   const u=need('admin');if(!u)return;const s=db.subs.find(x=>x.id===id);if(!s||s.status!=='pending')return;
-  s.status='approved';s.reviewed_by=u.id;s.reviewed_at=new Date().toISOString();
-  notify(s.submitter_id,'Post approved by admin','"'+s.title+'" passed admin review and is waiting for the manager to publish it.');
-  db.users.filter(x=>x.role==='manager'&&x.status==='active').forEach(m=>notify(m.id,'Post ready to publish','"'+s.title+'" was approved by an admin.'));
-  save();closeDlg();toast('Approved and sent to the manager.');render(true);
+  await must(sb.rpc('review_submission',{p_id:id,p_action:'approve',p_note:''}));
+  closeDlg();await after('Approved and sent to the manager.');
 };
-A['sub-publish']=(el,id)=>{
+A['sub-publish']=async(el,id)=>{
   const u=need('manager');if(!u)return;const s=db.subs.find(x=>x.id===id);
   if(!s||s.event_id||s.status==='rejected')return;
-  const eid=nid('events');
-  db.events.push({id:eid,title:s.title,category_id:s.category_id,department_id:s.department_id,organizer:s.organizer,description:s.description,date:s.date,time:s.time,location:s.location,deadline:s.deadline,link:s.link,type:catName(s.category_id)==='External Opportunity'?'external':'diu',status:'published',created_by:u.id,created:new Date().toISOString()});
-  s.status='approved';s.event_id=eid;s.reviewed_by=u.id;s.reviewed_at=new Date().toISOString();
-  notify(s.submitter_id,'Post published','"'+s.title+'" is now live on DIU EVENT-X.');
-  save();closeDlg();toast('Approved and published.');render(true);
+  await must(sb.rpc('review_submission',{p_id:id,p_action:'publish',p_note:''}));
+  closeDlg();await after('Approved and published.');
 };
 A['ev-new']=el=>{if(need('admin','manager'))openDlg(eventFormHtml(null,Number(el.dataset.cat)||0));};
 A['ev-edit']=(el,id)=>{if(!need('admin','manager'))return;const e=evt(id);if(e)openDlg(eventFormHtml(e));};
-A['ev-publish']=(el,id)=>{if(!need('admin','manager'))return;const e=evt(id);if(!e)return;e.status='published';save();toast('Event published.');render(true);};
+A['ev-publish']=async(el,id)=>{if(!need('admin','manager'))return;await changed(sb.from('events').update({status:'published'}).eq('id',id));await after('Event published.');};
+A['ev-unpublish']=async(el,id)=>{if(!need('admin','manager'))return;await changed(sb.from('events').update({status:'pending'}).eq('id',id));await after('Event unpublished.');};
 A['ev-delete']=async(el,id)=>{
   if(!need('manager'))return;const e=evt(id);if(!e)return;
   if(!await confirmBox('Delete this event?','"'+e.title+'" and all of its registrations, volunteer applications and saved bookmarks will be removed.','Delete event',true))return;
-  db.events=db.events.filter(x=>x.id!==id);db.regs=db.regs.filter(x=>x.event_id!==id);db.vols=db.vols.filter(x=>x.event_id!==id);db.saved=db.saved.filter(x=>x.event_id!==id);
-  save();toast('Event deleted.');render(true);
+  await changed(sb.from('events').delete().eq('id',id));
+  await after('Event deleted.');
 };
-A['app-set']=(el,id)=>{
+A['app-set']=async(el,id)=>{
   if(!need('admin','manager'))return;
-  const t=el.dataset.type==='vols'?'vols':'regs',st=el.dataset.status==='approved'?'approved':'rejected';
-  const r=db[t].find(x=>x.id===id);if(!r)return;const e=evt(r.event_id);
-  r.status=st;
-  notify(r.student_id,(t==='vols'?'Volunteer application ':'Registration ')+st,'Your '+(t==='vols'?'volunteer application':'registration')+' for "'+(e?e.title:'an event')+'" was '+st+'.');
-  save();toast('Marked '+st+'.');render(true);
+  const t=el.dataset.type==='vols'?'volunteer_applications':'event_registrations',st=el.dataset.status==='approved'?'approved':'rejected';
+  await changed(sb.from(t).update({status:st}).eq('id',id));
+  await after('Marked '+st+'.');
 };
-A['news-toggle']=(el,id)=>{if(!need('admin','manager'))return;const n=db.news.find(x=>x.id===id);if(!n)return;n.status=n.status==='published'?'draft':'published';save();toast(n.status==='published'?'News published.':'News moved to drafts.');render(true);};
+A['news-toggle']=async(el,id)=>{
+  if(!need('admin','manager'))return;const n=db.news.find(x=>x.id===id);if(!n)return;
+  const st=n.status==='published'?'draft':'published';
+  await changed(sb.from('news_posts').update({status:st}).eq('id',id));
+  await after(st==='published'?'News published.':'News moved to drafts.');
+};
 A['news-delete']=async(el,id)=>{
   if(!need('admin','manager'))return;const n=db.news.find(x=>x.id===id);if(!n)return;
   if(!await confirmBox('Delete this news item?','"'+n.title+'" will be removed for everyone.','Delete',true))return;
-  db.news=db.news.filter(x=>x.id!==id);save();toast('News deleted.');render(true);
+  await changed(sb.from('news_posts').delete().eq('id',id));
+  await after('News deleted.');
 };
 A['stu-toggle']=async(el,id)=>{
   if(!need('manager'))return;const x=user(id);if(!x||x.role!=='student')return;
   if(x.status==='active'&&!await confirmBox('Deactivate '+x.name+'?','They will not be able to log in until you activate the account again.','Deactivate',true))return;
-  x.status=x.status==='active'?'inactive':'active';save();toast(x.name+' is now '+x.status+'.');render(true);
+  const st=x.status==='active'?'inactive':'active';
+  await changed(sb.from('profiles').update({account_status:st}).eq('id',x.auth_id));
+  await after(x.name+' is now '+st+'.');
 };
 A['admin-toggle']=async(el,id)=>{
   if(!need('manager'))return;const x=user(id);if(!x||x.role!=='admin')return;
+  let st;
   if(x.status==='active'){
     if(!await confirmBox('Deactivate '+x.name+'?','They will lose access to admin tools.','Deactivate',true))return;
-    x.status='inactive';
+    st='inactive';
   }else{
     if(db.users.filter(a=>a.role==='admin'&&a.status==='active').length>=3)return toast('Maximum of 3 active admins. Deactivate another admin first.','danger');
-    x.status='active';
+    st='active';
   }
-  save();toast(x.name+' is now '+x.status+'.');render(true);
+  await changed(sb.from('profiles').update({account_status:st}).eq('id',x.auth_id));
+  await after(x.name+' is now '+st+'.');
 };
 
 A['sb-open']=()=>{const a=$('#sidebar');if(a)a.classList.add('open');document.body.classList.add('sb-on');};
@@ -1051,14 +1070,14 @@ document.addEventListener('click',async e=>{
   const el=e.target.closest('[data-act]');if(!el)return;
   const fn=A[el.dataset.act];if(!fn)return;
   e.preventDefault();
-  try{await fn(el,Number(el.dataset.id)||0,e);}catch(err){console.error(err);toast('Something went wrong. Please try again.','danger');}
+  try{await fn(el,Number(el.dataset.id)||0,e);}catch(err){console.error(err);toast(niceErr(err),'danger');}
 });
 document.addEventListener('submit',async e=>{
   const f=e.target.closest('form[data-form]');if(!f)return;
   e.preventDefault();
   const h=F[f.dataset.form];if(!h)return;
   const b=$('.form-msg',f);if(b)b.hidden=true;
-  try{await h(f,new FormData(f));}catch(err){console.error(err);formError(f,'Something went wrong. Please try again.');}
+  try{await h(f,new FormData(f));}catch(err){console.error(err);formError(f,niceErr(err));}
 });
 document.addEventListener('change',e=>{
   const s=e.target.closest('select[data-autosubmit]');
@@ -1072,12 +1091,64 @@ document.addEventListener('input',e=>{
   $$('#'+i.dataset.filter+' tbody tr').forEach(r=>{r.hidden=k&&r.textContent.toLowerCase().indexOf(k)<0;});
 });
 
+/* ---- email links (confirm signup / reset password) ---- */
+const friendlyLinkError=()=>'This link has expired or was already used. Request a new one and open only the newest email.';
+async function handleAuthRedirect(){
+  if(!sb)return null;
+  const sp=new URLSearchParams(location.search),h=location.hash||'';
+  const hp=(h&&h.charAt(1)!=='/'&&h.indexOf('=')>0)?new URLSearchParams(h.slice(1)):null;
+  const clean=()=>{try{history.replaceState(null,'',location.pathname+'#/');}catch(e){}};
+  const errCode=(hp&&(hp.get('error_code')||hp.get('error')))||sp.get('error_code')||sp.get('error');
+  if(errCode){clean();return {error:{message:friendlyLinkError()}};}
+  const th=sp.get('token_hash'),ty=sp.get('type');
+  if(th&&ty){clean();const {data,error}=await sb.auth.verifyOtp({token_hash:th,type:ty});return error?{error:{message:friendlyLinkError()}}:{type:ty,session:data.session};}
+  if(sp.get('code')){const code=sp.get('code');clean();const {data,error}=await sb.auth.exchangeCodeForSession(code);return error?{error:{message:friendlyLinkError()}}:{type:'code',session:data.session};}
+  if(hp&&hp.get('access_token')&&hp.get('refresh_token')){
+    const type=hp.get('type');clean();
+    const {data,error}=await sb.auth.setSession({access_token:hp.get('access_token'),refresh_token:hp.get('refresh_token')});
+    return error?{error:{message:friendlyLinkError()}}:{type,session:data.session};
+  }
+  return null;
+}
+
 async function main(){
   applyTheme();
-  db=await loadDb();
-  if(sb){try{const {data:{session}}=await sb.auth.getSession();if(session?.user){const u=await hydrateAuthUser(session.user);if(u&&u.status==='active')ss.set('uid',String(u.id));}sb.auth.onAuthStateChange((event,session)=>{if(event==='SIGNED_OUT'){authUser=null;ss.del('uid');}else if(session?.user){authUser=session.user;}});}catch(err){console.error('Supabase session restore failed:',err);}}
+  // Application data now lives in Supabase only; remove leftovers from the old demo build.
+  ls.del(KEY);ls.del('uid');ss.del('uid');
   window.addEventListener('hashchange',()=>render());
+  document.addEventListener('focusout',flushPending);
+  $('#dlg').addEventListener('close',flushPending);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&sb)scheduleRefresh();});
+  setInterval(()=>{if(!document.hidden&&sb)scheduleRefresh();},60000);
+  let redirect=null;
+  if(sb){
+    sb.auth.onAuthStateChange((event,session)=>{
+      setTimeout(async()=>{
+        try{
+          if(event==='SIGNED_OUT'){if(authUser){authUser=null;await loadAll();setupRealtime();softRender();}}
+          else if(event==='PASSWORD_RECOVERY'){ss.set('recovery','1');}
+          else if(session&&session.user&&authUser&&session.user.id===authUser.id&&(event==='TOKEN_REFRESHED'||event==='USER_UPDATED'))authUser=session.user;
+        }catch(err){console.error(err);}
+      },0);
+    });
+    try{redirect=await handleAuthRedirect();}catch(err){console.error(err);}
+    try{
+      const {data:{session}}=await sb.auth.getSession();
+      if(session&&session.user){
+        const u=await hydrateAuthUser(session.user);
+        if(u&&u.status!=='active'){await sb.auth.signOut();authUser=null;}
+      }
+    }catch(err){console.error('Supabase session restore failed:',err);authUser=null;}
+    if(!authUser){try{await loadAll();}catch(err){console.error(err);toast(niceErr(err),'danger');}}
+    setupRealtime();
+  }else toast('Supabase connection is unavailable. Check supabase-config.js and internet access.','danger');
+  if(redirect){
+    if(redirect.error){toast(redirect.error.message,'danger');history.replaceState(null,'','#/forgot');}
+    else if(redirect.type==='recovery'||ss.get('recovery')){ss.set('recovery','1');history.replaceState(null,'','#/reset');}
+    else{const u=me();toast('Email confirmed. Welcome to DIU EVENT-X!');history.replaceState(null,'','#'+(u?dashPath(u.role):'/login'));}
+  }
   render();
 }
 main();
+
 })();
