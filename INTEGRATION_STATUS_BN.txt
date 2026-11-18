@@ -1,0 +1,18 @@
+DIU EVENT-X — Supabase integration status
+
+এই ZIP-এ যা করা হয়েছে:
+1. Supabase JS v2 CDN যুক্ত করা হয়েছে।
+2. Supabase project URL ও publishable key দিয়ে client initialize করার config যুক্ত করা হয়েছে।
+3. মূল style.css, logo, images এবং layout অপরিবর্তিত রাখা হয়েছে।
+
+গুরুত্বপূর্ণ: এটি এখনো পূর্ণ Supabase integration নয়। মূল app.js এখনো browser LocalStorage demo database ব্যবহার করে। তাই login/registration/event CRUD/approval/notifications এখনো Supabase-এ persist করে না। এই ZIP-কে production-ready বা complete বলা যাবে না।
+
+পরবর্তী integration কাজ:
+- Supabase Auth login/signup/password reset
+- profiles + student_profiles + preferences mapping
+- events, registrations, volunteer applications, saved events, submissions, news ও notifications-এর read/write mapping
+- existing numeric UI IDs থেকে Supabase UUID mapping
+- RLS অনুযায়ী staff/admin/manager operations এবং error handling
+- demo seed/localStorage removal এবং end-to-end test
+
+Security: frontend-এ publishable key রাখা স্বাভাবিক; service_role key কখনো frontend-এ দেবেন না। RLS অবশ্যই enabled রাখতে হবে।
